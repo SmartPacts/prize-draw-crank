@@ -32,7 +32,7 @@ User=prizedraw
 Group=prizedraw
 # The code is root's; the service can only READ it, so a compromised crank cannot rewrite what it
 # runs. The only thing the service user owns is its key directory, /etc/prize-draw.
-WorkingDirectory=/opt/prize-draw/site
+WorkingDirectory=/opt/prize-draw-crank
 Environment=NODE_ENV=production
 # MAINNET INTERLOCKS. crank.mjs refuses to touch mainnet unless every one of these is set
 # deliberately; none of them has a default that could be inherited from a devnet session.
@@ -42,7 +42,7 @@ Environment=DEVNET_HOST=https://chainweb.eckowallet.com
 Environment=CHAIN_ID=2
 Environment=DRAW_NS=n_48867b242317a0216a67f8c7ca26696b5878e0e3
 # The key file lives OUTSIDE the checkout, and that is enforced: crank.mjs refuses a key file
-# anywhere under the repository root (/opt/prize-draw), so this path is /etc, not /opt.
+# anywhere under this checkout (/opt/prize-draw-crank), so the key lives in /etc, not /opt.
 Environment=DRAW_ACCOUNTS=/etc/prize-draw/crank-key.json
 Environment=DRAW_BOT=crank
 # Block recording is already covered, raffle-blind, by the block-history feeders. The crank's job
