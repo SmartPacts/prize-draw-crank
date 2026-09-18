@@ -42,7 +42,9 @@ what the contract's own calendar checks compare against.
     DRAW_ATTEST=off \
     node crank.mjs
 
-Add `--once` for a single pass. Generate a key with:
+Add `--once` for a single pass. If the contract is not deployed on that chain it stops at
+`cannot read <namespace>.prize-draw` — it reads the deployed module to learn which block record
+decides a round, and will not guess it. Generate a key with:
 
     node crank-keygen.mjs /etc/prize-draw/crank-key.json
 
