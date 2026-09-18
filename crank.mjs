@@ -129,6 +129,26 @@ if (MAINNET) {
 if (!existsSync(ACCTS)) { console.error(`no personas at ${ACCTS}`); process.exit(1); }
 const BOT = JSON.parse(readFileSync(ACCTS, 'utf8'))[WHO];
 if (!BOT) { console.error(`no persona "${WHO}" in ${ACCTS}`); process.exit(1); }
+
+// ---- WHERE THE EARNINGS GO. Settling a round pays the drawer's share of that
+// raffle's fee to an account THE DRAW NAMES, and the contract accepts any
+// ordinary account — so this bot never has to hold what it earns. Point it at a
+// cold account you control and the hot key on this machine only ever holds gas.
+// The default is the bot's own account, which is what a fresh operator expects:
+// earnings accumulate where the gas is paid from, and nothing is lost by not
+// setting it.
+const PAYEE = process.env.DRAW_PAYEE ?? BOT.account;
+// The module refuses a module account here (every raffle pool is one), and its
+// refusal would abort the whole draw. Fail at startup instead, where it is a
+// configuration message and not a settled round that will not settle.
+if (PAYEE.startsWith('m:')) {
+  console.error(`DRAW_PAYEE must not be a module account: ${PAYEE}`);
+  process.exit(1);
+}
+if (PAYEE.length < 3 || /[\s"]/.test(PAYEE)) {
+  console.error(`DRAW_PAYEE does not look like an account name: ${JSON.stringify(PAYEE)}`);
+  process.exit(1);
+}
 const client = createClient(({ chainId, networkId }) =>
   `${HOST_URL}/chainweb/0.0/${networkId}/chain/${chainId}/pact`);
 
@@ -150,6 +170,32 @@ const toMs = (iso) => Date.parse(String(iso).replace(/(\.\d{3})\d+/, '$1'));
 const stamp = () => new Date().toLocaleTimeString();
 const say = (m) => console.log(`${stamp()}  ${m}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ---- THE DEAD-MAN'S SWITCH. Set HEARTBEAT_URL to a ping URL from any uptime
+// service that alerts when pings STOP (healthchecks.io's free tier, Better
+// Stack, your own endpoint). This bot pings it after every pass in which it
+// read the chain successfully, so silence means the process, the machine, the
+// network or the node is gone — and you hear about it from something that is
+// not running on the machine that died. Nothing tells you otherwise: a crank
+// that stops settling delays draws until someone notices.
+//
+// It never throws and never waits long: monitoring that can break the thing it
+// monitors is worse than no monitoring. Be honest about what it proves — the
+// bot is alive and can read the chain, NOT that a particular round settled.
+const HEARTBEAT_URL = process.env.HEARTBEAT_URL ?? '';
+let beatFailed = false;
+async function beat() {
+  if (!HEARTBEAT_URL) return;
+  try {
+    await fetch(HEARTBEAT_URL, { signal: AbortSignal.timeout(10000) });
+    beatFailed = false;
+  } catch (e) {
+    // Said once per outage, not once per pass: a heartbeat that cannot be sent
+    // is worth knowing about, but it is not what this bot is for.
+    if (!beatFailed) say(`heartbeat ping failed (${String(e.message).slice(0, 80)}) — the bot keeps running`);
+    beatFailed = true;
+  }
+}
 
 async function local(code) {
   const tx = Pact.builder.execution(code)
@@ -206,6 +252,29 @@ const CODE = await local(`(at 'code (describe-module "${MOD}"))`).catch((e) => {
 const USE = String(CODE).match(/\(use ([\w.-]+\.block-history) "[A-Za-z0-9_-]{43}"/);
 if (!USE) { console.error(`${MOD} on chain does not name a block-history record — is this the right module?`); process.exit(1); }
 const BH = USE[1];
+
+// The payee must ALREADY EXIST on this chain. A round pays every party with
+// `transfer`, not `transfer-create`, so naming an account that has never been
+// funded does not create it — it aborts the draw, every time, for every raffle.
+// That failure would look like a broken contract and is really a typo, so it is
+// caught here, once, before the bot claims to be settling anything.
+{
+  const known = await local(`(try false (and (!= "" "${PAYEE}") (>= (coin.get-balance "${PAYEE}") 0.0)))`);
+  if (known !== true && PAYEE !== BOT.account) {
+    // A payee someone TYPED. Almost always a typo or an account that was never funded, and the
+    // cost of guessing wrong is every draw aborting, so this is a refusal, not a warning.
+    console.error(`DRAW_PAYEE ${PAYEE} does not exist on chain ${CH} of ${NETWORK}.`);
+    console.error('Earnings are paid with a plain transfer, so an account that does not exist yet would');
+    console.error('abort every draw. Create or fund it first, then start the crank again.');
+    process.exit(1);
+  }
+  if (known !== true) {
+    // The payee is this bot's own account and it holds nothing yet: that is an unfunded new crank,
+    // not a mistake. It cannot pay for a transaction anyway, so say so plainly and carry on
+    // reading — refusing here would only replace a clear message with a confusing one.
+    say(`this bot's account does not exist on chain ${CH} yet: fund ${BOT.account} before it can settle anything`);
+  }
+}
 
 const W = await local(`${MOD}.DECIDE-WINDOW`);
 // Seconds of chain time past a round's draw instant after which a draw nobody
@@ -383,7 +452,7 @@ async function handleRound(id, seq, rd, key) {
       say(`${id} round ${seq}: block ${pv['deciding-block']} decides it (${whichCandidate(pv['deciding-block'], dh)}; hash`
         + ` ${pv['block-hash']}) — preview: ranks ${JSON.stringify(pv.ranks)} pay ${JSON.stringify(pv.amounts)}`);
     } catch (e) { say(`${id} round ${seq}: preview refused: ${e.message}`); }
-    try { say(`  ${await send(`(${MOD}.draw "${id}" ${seq} "${BOT.account}")`, `${id} DRAW`, 8000, 300000)}`); finished.add(key); return; }
+    try { say(`  ${await send(`(${MOD}.draw "${id}" ${seq} "${PAYEE}")`, `${id} DRAW`, 8000, 300000)}`); finished.add(key); return; }
     catch (e) { say(`  draw refused: ${e.message}`); }
     return TIGHT;
   }
@@ -464,11 +533,16 @@ async function loop(id) {
 
 say(`Prize Draw draw bot — ${HOST_URL} chain ${CH} ${MOD} (block record ${BH})`);
 say(`signing as ${WHO} ${BOT.account.slice(0, 16)}…  poll ${POLL}ms when a draw is close, otherwise up to ${Math.round(MAX_SLEEP / 1000)}s  ${ATTEST ? `attest a shot every ${SHOT_MS}ms across the window` : 'NOT attesting (DRAW_ATTEST=off)'}${ONCE ? '  (single pass)' : ''}`);
+say(`earnings go to ${PAYEE}${PAYEE === BOT.account ? ' (this bot\'s own account — set DRAW_PAYEE to send them elsewhere)' : ''}`
+  + `  ·  heartbeat ${HEARTBEAT_URL ? 'ON' : 'OFF (set HEARTBEAT_URL and nothing will tell you when this bot dies)'}`);
 say(`rounds run on the calendar (chain time) and exist from their first ticket: this bot opens each draw at its draw instant, which names ${W} candidate blocks;`
   + ` the lowest recorded decides, and the draw goes out the moment one is on record; a draw still unopened ${OPEN_GRACE} s past its instant is reported LOUDLY`);
 if (ONCE) {
   const ids = await local(`(${MOD}.list-raffles)`);
   await Promise.allSettled(ids.map((id) => handle(id).catch((e) => say(`${id}: ${e.message}`))));
+  // A single pass pings too, so `--once` also proves the heartbeat URL works rather than leaving
+  // you to find out from the alert that never came.
+  await beat();
   process.exit(0);
 }
 for (;;) {
@@ -476,6 +550,9 @@ for (;;) {
     for (const id of await local(`(${MOD}.list-raffles)`)) {
       if (!loops.has(id)) { say(`watching ${id}`); loops.set(id, loop(id)); }
     }
+    // Only on the path where the read SUCCEEDED: an unreachable node must make
+    // the pings stop, or the switch reports health it has not established.
+    await beat();
   } catch (e) { say(`list error: ${String(e.message).slice(0, 140)}`); }
   await sleep(15000);
 }

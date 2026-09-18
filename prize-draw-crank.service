@@ -55,6 +55,16 @@ Environment=DRAW_ATTEST=off
 # and the draw still went out 35 s after its instant.
 Environment=POLL_MS=2500
 Environment=MAX_SLEEP_MS=300000
+
+# YOUR SETTINGS GO IN A FILE, NOT IN THIS UNIT. Everything above is a shipped
+# default that an update overwrites; /etc/prize-draw/crank.env is yours and is
+# never touched by an update. systemd documents these as overriding Environment=
+# above whatever the order, so anything you put there wins.
+#   DRAW_PAYEE=k:…          where this bot's earnings are paid — set it to a cold
+#                           account and the hot key here only ever holds gas
+#   HEARTBEAT_URL=https://… a ping URL that alerts when the pings STOP
+# The leading `-` means the unit still starts when the file does not exist.
+EnvironmentFile=-/etc/prize-draw/crank.env
 ExecStart=/usr/local/bin/node crank.mjs
 Restart=always
 RestartSec=30
