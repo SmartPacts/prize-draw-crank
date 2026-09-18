@@ -1,0 +1,82 @@
+# /etc/systemd/system/prize-draw-crank.service — the prize-draw crank: opens each round's draw at
+# its advertised instant and settles it.
+#
+# Modelled on block-history-feeder.service, which has been running this shape on a DigitalOcean
+# droplet since 2026-09. Install it, but DO NOT enable it here: ENABLING IT STARTS SENDING MAINNET
+# TRANSACTIONS, so that step belongs to the operator, after the module is deployed and the crank's
+# account is funded:
+#   systemctl enable --now prize-draw-crank
+#   journalctl -u prize-draw-crank -f
+#
+# Started too early it is harmless: with no module deployed, or no KDA on the key, it fails its
+# own startup checks and exits without sending anything.
+#
+# WHAT THIS PROCESS CAN AND CANNOT DO. Every call it makes is permissionless — `open-draw`, the
+# draw itself, `escape`, `claim-escape`. It holds no operator or admin authority, cannot choose a
+# winner, and cannot move money anywhere the contract would not send it anyway. The worst a stolen
+# crank key buys is the gas in its own account and the drawer's share of a fee.
+
+[Unit]
+Description=prize-draw crank (opens draws at their instant and settles them)
+After=network-online.target
+Wants=network-online.target
+# A persistent misconfiguration (an unfunded key, the module not yet deployed) makes the crank exit
+# at startup. Without a limit systemd would restart it forever and hammer the public node with
+# reads. Five failed starts in 30 minutes stops it until someone looks.
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=prizedraw
+Group=prizedraw
+# The code is root's; the service can only READ it, so a compromised crank cannot rewrite what it
+# runs. The only thing the service user owns is its key directory, /etc/prize-draw.
+WorkingDirectory=/opt/prize-draw/site
+Environment=NODE_ENV=production
+# MAINNET INTERLOCKS. crank.mjs refuses to touch mainnet unless every one of these is set
+# deliberately; none of them has a default that could be inherited from a devnet session.
+Environment=DRAW_MAINNET=armed
+Environment=DEVNET_NETWORK_ID=mainnet01
+Environment=DEVNET_HOST=https://chainweb.eckowallet.com
+Environment=CHAIN_ID=2
+Environment=DRAW_NS=n_48867b242317a0216a67f8c7ca26696b5878e0e3
+# The key file lives OUTSIDE the checkout, and that is enforced: crank.mjs refuses a key file
+# anywhere under the repository root (/opt/prize-draw), so this path is /etc, not /opt.
+Environment=DRAW_ACCOUNTS=/etc/prize-draw/crank-key.json
+Environment=DRAW_BOT=crank
+# Block recording is already covered, raffle-blind, by the block-history feeders. The crank's job
+# here is only to open draws and settle them.
+Environment=DRAW_ATTEST=off
+# Pace. The crank sleeps until the next thing that could need doing — a round's draw instant, which
+# it knows from the chain — and polls at POLL_MS only when that moment is close or a candidate
+# window is open. MAX_SLEEP_MS caps a long sleep, which is what bounds how late a round re-scheduled
+# to draw EARLIER could be picked up. Measured on devnet: ten minutes of selling cost two wake-ups,
+# and the draw still went out 35 s after its instant.
+Environment=POLL_MS=2500
+Environment=MAX_SLEEP_MS=300000
+ExecStart=/usr/local/bin/node crank.mjs
+Restart=always
+RestartSec=30
+# A leak must not take the whole machine down with it. MEASURED 2026-09-18: the crank sits at
+# 88 MB RSS, flat, while watching four raffles. The cap is ~2x that, deliberately well under the
+# 512 MB droplet it runs on: past this systemd kills and restarts it (RestartSec=30) instead of
+# letting the box swap itself to a standstill. Raise it only with a new measurement.
+MemoryMax=200M
+
+# The crank holds a hot key with a small gas balance. Unprivileged user; the file system is
+# read-only to it. It never needs to write its key, so it cannot alter it.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Deliberately NOT set: MemoryDenyWriteExecute, which breaks V8's JIT.
+
+[Install]
+WantedBy=multi-user.target

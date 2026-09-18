@@ -1,0 +1,14 @@
+{
+  "name": "prize-draw-crank",
+  "type": "module",
+  "description": "Settles Prize Draw rounds on Kadena: opens each draw at its instant and sends the draw when a candidate block is recorded. Permissionless \u2014 anyone can run one.",
+  "scripts": {
+    "crank": "node crank.mjs",
+    "keygen": "node crank-keygen.mjs"
+  },
+  "dependencies": {
+    "@kadena/client": "^1.18.3",
+    "@kadena/cryptography-utils": "^0.4.4"
+  },
+  "license": "Apache-2.0"
+}
