@@ -13,8 +13,10 @@
 #
 # WHAT THIS PROCESS CAN AND CANNOT DO. Every call it makes is permissionless — `open-draw`, the
 # draw itself, `escape`, `claim-escape`. It holds no operator or admin authority, cannot choose a
-# winner, and cannot move money anywhere the contract would not send it anyway. The worst a stolen
-# crank key buys is the gas in its own account and the drawer's share of a fee.
+# winner, and cannot move money anywhere the contract would not send it anyway. A stolen crank key
+# costs what its own account holds: the gas and, with DRAW_PAYEE unset (the default), every
+# drawer's share it has earned and not moved out. With DRAW_PAYEE set, it holds the gas alone
+# (plus the recorder's shares, if DRAW_ATTEST is turned on).
 
 [Unit]
 Description=prize-draw crank (opens draws at their instant and settles them)
@@ -74,8 +76,9 @@ RestartSec=30
 # letting the box swap itself to a standstill. Raise it only with a new measurement.
 MemoryMax=200M
 
-# The crank holds a hot key with a small gas balance. Unprivileged user; the file system is
-# read-only to it. It never needs to write its key, so it cannot alter it.
+# The crank holds a hot key with a gas balance, and its earnings too unless DRAW_PAYEE sends them
+# elsewhere. Unprivileged user; the file system is read-only to it. It never needs to write its
+# key, so it cannot alter it.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

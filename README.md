@@ -6,9 +6,11 @@ drawn it triggers the refund and pushes every buyer's money back.
 
 **It holds no privilege, and that is the point.** Every call it makes — `open-draw`, `draw`,
 `escape`, `claim-escape` — is permissionless: anybody can make them, and the contract gives the
-sender no say in the outcome. The winner is a pure function of the round's key and the hash of a
-block that nobody picked. A crank pays gas and gets the drawer's share of the round's fee, if the
-raffle sets one.
+sender no say in the outcome. Under the contract's rules the winners follow from the round's key
+and the hash of a block that did not exist when the draw was opened; a miner can tilt which block
+decides, but never choose a winner; and until the contract is frozen, its admin keys can override
+those rules ([details](https://github.com/SmartPacts/prize-draw#readme)). A crank pays gas and gets
+the drawer's share of the round's fee, if the game sets one.
 
 **So run one.** More independent cranks means a draw cannot be delayed by one operator's bot dying,
 and none of them can steer a result. This repository exists so that anyone can.
@@ -96,13 +98,17 @@ sending transactions:
     journalctl -u prize-draw-crank -f
 
 What to watch for: a round that stays unsettled past its draw instant. Anyone can open and settle it
-by hand, so a dead crank delays a draw — it does not cancel one.
+by hand, so a missing crank only delays a draw — but if nobody opens the draw within a day of its
+instant, anyone may trigger a refund of the round instead, so a crank that is down for over a day
+can turn a round into a refund.
 
 ## What it cannot do
 
 It cannot choose a winner, change a raffle, or move money anywhere the contract would not send it
-anyway. It never holds the contract's admin or operator authority. The worst a stolen crank key
-costs is the gas in its own account and a drawer's share of a fee.
+anyway. It never holds the contract's admin or operator authority. A stolen crank key costs what
+its own account holds: with `DRAW_PAYEE` unset (the default) that is the gas **and every drawer's
+share it has earned** and not moved out; with `DRAW_PAYEE` set, it is the gas alone (one exception
+under [Your earnings](#your-earnings)).
 
 It reads which block record the contract uses **from the deployed contract itself**, so it cannot
 attest to a different record than the one a round settles from.
@@ -110,9 +116,14 @@ attest to a different record than the one a round settles from.
 ## Your earnings
 
 Settling a round pays the drawer's share of that raffle's fee to an account **the draw names**, and
-the contract takes any ordinary account. So set `DRAW_PAYEE` to somewhere you control and this
-machine never holds what it earns — the key here stays a gas key, and the worst a stolen one costs
-is the gas in it.
+the contract takes any ordinary account. Left unset, `DRAW_PAYEE` names the bot's own account, so
+everything it earns piles up on the hot key here, and a stolen or lost key takes all of it. Set
+`DRAW_PAYEE` to somewhere you control and this machine never holds what it earns — the key here
+stays a gas key, and the worst a stolen one costs is the gas in it.
+
+The one exception is recording blocks. With `DRAW_ATTEST` on (it is off on mainnet by default), the
+recorder's share of a fee is paid to whoever paid the gas for the recording — this key — whatever
+`DRAW_PAYEE` says.
 
 🔴 **The payee must already exist on the raffle's chain.** Payouts use a plain transfer, which does
 not create an account, so an unfunded one would abort every draw. The bot checks at startup and
@@ -122,7 +133,7 @@ refuses to run rather than find out mid-round.
 
 The key is generated here and never leaves, which is what keeps it safe — and also what makes this
 machine a single point of failure. There is no seed phrase to fall back on: a dead disk takes the
-balance and everything earned with it.
+key's balance with it — the gas, and everything it earned unless `DRAW_PAYEE` sends that elsewhere.
 
     node key-backup.mjs save  /etc/prize-draw/crank-key.json  crank-key.backup
     node key-backup.mjs check crank-key.backup
@@ -147,8 +158,10 @@ the chain — not that a particular round settled.
 ## If a crank is down
 
 Nothing here is privileged, so **anyone can finish the job by hand**, including you, from any
-machine with a funded account. A dead crank delays a draw; it cannot cancel one, change a winner, or
-strand the money.
+machine with a funded account. A dead crank delays a draw and cannot change a winner or strand the
+money — but once a day has passed since the draw instant with the draw still unopened, anyone may
+refund the round instead of drawing it, so a crank that is down for over a day can turn a round into
+a refund.
 
 1. What state is the round in? `(<ns>.prize-draw.draw-status "<raffle>" <round>)` over `/local`.
 2. Past its draw instant and not open → `(<ns>.prize-draw.open-draw "<raffle>" <round>)`.
