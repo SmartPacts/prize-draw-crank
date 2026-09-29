@@ -1,104 +1,74 @@
-// Prize Draw — the draw bot. Watches every raffle and settles its rounds. At each
-// round's DRAW INSTANT it OPENS THE DRAW, which fixes the round's candidate
-// blocks as the next ones on the chain; it then RECORDS them into block-history
-// itself and, the moment ANY candidate is on record, sends the draw. If none of
-// the candidates is ever recorded it escapes the round as soon as that is
-// certain and pushes every refund. Anyone may run this; it holds no privilege
-// and cannot choose an outcome — every call it makes is permissionless, and the
-// winner is a pure function of the round's key and of a block hash nobody
-// picked. Run at least two of these, on separate machines.
+// Prize Draw — the draw bot. Watches every raffle and settles its rounds. Each
+// round is decided by ONE drand beacon, pinned when its first ticket was bought:
+// the drand evmnet round published a fixed margin after the round's draw
+// instant. Once the chain's clock passes that beacon's publish time, this bot
+// fetches the beacon's signature from a drand relay, checks it with a free
+// /local `preview` — which verifies it on chain exactly as `draw` will and says
+// who wins — then dry-runs the exact draw and sends it only if that passes,
+// with a gas limit sized from the dry run. If no relay can supply the beacon, it keeps
+// trying; only when the round's escape has opened on the CHAIN's clock (90 days
+// after the beacon was due) does it escape the round and push every refund.
+// Anyone may run this; it holds no privilege and cannot choose an outcome —
+// every call it makes is permissionless, and the winner is a pure function of
+// the round's key and of a beacon nobody can choose or predict. Run at least
+// two of these, on separate machines.
 //
-//   cd site && node crank.mjs              (add --once to do a single pass)
-//   DRAW_ATTEST=off node crank.mjs        settle only: never record a block
+//   node crank.mjs              (add --once to do a single pass)
 //
 // THE FLOW, PER ROUND. A round runs on the CALENDAR: the operator scheduled it
 // (opens-at, closes-at, draws-at — chain time, the PARENT block's stamp), and
-// the round EXISTS ONLY FROM ITS FIRST TICKET, which freezes those instants and
-// the raffle's terms into it. Nothing about the draw exists until draws-at:
-// then ANYONE may send `open-draw`, which fixes the round's CANDIDATE blocks as
-// decide-height = that block + DECIDE-DELAY and the DECIDE-WINDOW - 1 after it
-// (three, read from the module). The deciding block is the LOWEST RECORDED of
-// them; the module reports it as draw-status's `deciding-block`, -1 while none
-// is. The seed is that block's hash mixed with the round key — public, pure.
+// the round EXISTS ONLY FROM ITS FIRST TICKET, which freezes those instants,
+// the raffle's terms and the drand round that will decide it. `draw-status`
+// reports that drand round, when drand publishes it (`beacon-at`), and from
+// when the round could escape (`escape-from`).
 //   no round          ...  nothing to do: a round is started by a buyer, never
 //                          by this bot
 //   selling           ...  nothing to do, until closes-at
-//   sales closed      ...  nothing to do, until draws-at
-//   draw instant      ...  send open-draw (gas only) and, in the SAME pass, go
-//                          straight to the window it just named
-//   window open       ...  attest, shot after shot, from decide-height - 1 until
-//                          ANY candidate is on record or the last one's chance is gone
-//   a block decides   ...  send the draw AT ONCE (this bot is the draw-share
-//                          payee) — no confirmations wait, nothing to publish
-//   none recorded     ...  the round can never be drawn: escape it the moment
-//                          the window has closed and refund every buyer
-//   never opened      ...  should NEVER happen while a bot runs: if the draw is
-//                          still unopened OPEN-DRAW-GRACE-SECONDS past draws-at,
-//                          the bot says so LOUDLY, still tries to open it (a
-//                          late-opened draw is a fair draw), and only if the
-//                          module refuses escapes it — every stake returned
+//   sales closed      ...  nothing to do, until beacon-at
+//   beacon due        ...  fetch the pinned round's signature, preview it
+//                          (free), send the draw (this bot is the draw-share
+//                          payee)
+//   no beacon to be had  retry, backing off; escape ONLY once the chain's clock
+//                          is past escape-from, then refund every buyer
 //
-// WHY IT ATTESTS THE WINDOW ITSELF. block-history's `attest` takes no arguments:
-// a transaction mined in block N writes down block N-1 from values the engine
-// handed it, so a recorder chooses neither the height nor the hash — only
-// whether to speak. Candidate c can be recorded only by a transaction mined in
-// block c+1, and on mainnet about one block in twelve gets no recording at all
-// because miners refresh their block template only every ~15 s — which is why a
-// round has three candidates. A miss is not a failure: the next candidate is
-// what the window is for. "already recorded" is the good answer — another
-// recorder got there first.
+// WHY A RELAY NEED NOT BE TRUSTED. The contract verifies the signature against
+// drand's public key, pinned in a sealed module, and a signature for any other
+// round, or a forged one, aborts. So a relay cannot change a winner; the worst
+// one can do is stay silent or answer nonsense, which costs a relay, not a
+// round: the bot asks the next relay, and only ever sends a signature the chain
+// has already accepted in a /local preview.
 //
-// WHY MORE THAN ONE RECORDER MATTERS. A recorder that is ALONE sees each
-// candidate's outcome as it is mined and can decline to record one it dislikes
-// and take the next — a best of three at most. An independent recorder removes
-// that: it records whatever it sees. So this bot records every candidate it
-// can, and the design asks for at least two of it on separate machines.
-//
-// WHY SHOT AFTER SHOT. A transaction sent while the tip is at H is mined one or
-// two blocks later, so any single send is a coin flip for a given block. The bot
-// signs a fresh shot (its own nonce) every SHOT_MS while the tip is between
-// decide-height - 1 and the last candidate, and stops the moment any candidate
-// is recorded. A shot that lands late records some later block, which is harmless.
-//
-// DRAW_ATTEST=off makes this a settler only: it opens draws, draws, escapes
-// and refunds, and records nothing. That is how a crank runs beside independent
-// recorders — and how a devnet proof forces candidates to be missed, because
-// with no recorder running nothing can record them.
-//
-// Every raffle runs in its OWN loop. Two rounds that opened near each other have
-// windows near each other, and a bot busy firing at one would walk straight past
-// the other's.
+// Every raffle runs in its OWN loop, so one raffle waiting on a relay never
+// holds up another's draw.
 import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Pact, createClient, createSignWithKeypair } from '@kadena/client';
 
 const HOST_URL = process.env.DEVNET_HOST ?? 'http://localhost:8090';
 const NETWORK = process.env.DEVNET_NETWORK_ID ?? 'recap-development';
-// Chain 2 by default, like the site: on the casino devnet, chains 0 and 1 hold
-// OLDER immutable block-history versions and the pinned module never loads there.
 const CH = process.env.CHAIN_ID ?? '2';
 const NS = process.env.DRAW_NS ?? 'free';
 const MOD = `${NS}.prize-draw`;
 const POLL = Number(process.env.POLL_MS ?? 2500);
 // 🔴 THE BOT SLEEPS UNTIL THE NEXT THING THAT COULD NEED DOING, and polls at POLL only when that
-// thing is close. It waits for exactly two kinds of event: a CLOCK INSTANT it already knows (a
-// round's draw instant, frozen into the round at its first ticket and readable from the raffle
-// row before the round even exists), and a CANDIDATE BLOCK being recorded, which can only happen
-// inside a window it can see coming. Everything else is dead air, and polling through it taught
-// us nothing at the cost of ~35k reads a day per idle raffle against a node we do not own.
+// thing is close. It waits for CLOCK INSTANTS it already knows: a round's close, and the moment
+// drand publishes the round's pinned beacon — both frozen into the round at its first ticket.
+// Everything else is dead air, and polling through it taught us nothing at the cost of ~35k reads
+// a day per idle raffle against a node we do not own.
 // MAX_SLEEP bounds how stale a long sleep can make us: the operator can re-schedule a round to
 // draw EARLIER while we sleep, and this is what caps how late that can leave us.
 const MAX_SLEEP = Number(process.env.MAX_SLEEP_MS ?? 300000);
 // Wake this early, so the first tight pass happens just BEFORE the instant rather than after it.
 const LEAD = Number(process.env.LEAD_MS ?? 5000);
 const TIGHT = { tight: true };
-const SHOT_MS = Number(process.env.SHOT_MS ?? 1500);
-// On mainnet the bot attests only when told to: whether ops records the raffle's
-// chain at all is a decision, not a default (see STATUS.md), so DRAW_ATTEST=on is
-// required there and the devnet default of 'on' does not carry over.
-const ATTEST = (process.env.DRAW_ATTEST ?? (NETWORK === 'mainnet01' ? 'off' : 'on')) !== 'off';
 const ONCE = process.argv.includes('--once');
 const GAS_PRICE = 0.00000001;
+// 🔴 EVERY CALL TO THE NODE HAS A DEADLINE. A connection that hangs would otherwise stall its
+// raffle's loop forever while everything else looked fine. A /local or a submit gets this long; the
+// wait for a send to be mined gets its own timeout plus this. A timed-out call is a NODE failure,
+// never a contract answer: it is not logged as a refusal, and the pass it happened in does not
+// count as healthy.
+const NODE_TIMEOUT = (() => { const v = Number(process.env.NODE_TIMEOUT_MS ?? 30000); return Number.isFinite(v) && v > 0 ? v : 30000; })();
 const HERE = new URL('.', import.meta.url).pathname;
 const ACCTS = process.env.DRAW_ACCOUNTS ?? `${HERE}.accounts.json`;
 const WHO = process.env.DRAW_BOT ?? 'admin';   // any funded persona; the bot needs no privilege
@@ -122,7 +92,7 @@ if (MAINNET) {
     refuse(`the key file must live outside this checkout, not at ${ACCTS}`);
   if (!process.env.DRAW_BOT)
     refuse('DRAW_BOT must name the signing account explicitly; there is no default on mainnet');
-  console.error(`ARMED for mainnet01 chain ${CH}: signing as ${WHO}, attest ${ATTEST ? 'ON' : 'off'}, namespace ${NS}`);
+  console.error(`ARMED for mainnet01 chain ${CH}: signing as ${WHO}, namespace ${NS}`);
 }
 
 
@@ -159,24 +129,186 @@ const unwrap = (v) => {
   if ('decimal' in v) return Number(v.decimal);
   // Pact 5 encodes a time as {"time": "…Z"} on a whole second and {"timep":
   // "….%vZ"} otherwise (pact-5 LegacyCodec.hs, timeCodec). Only a one-key object
-  // is a time: block-history's {hash, time, by} rows must stay objects.
+  // is a time, so a row that has a field named `time` stays an object.
   if ('timep' in v) return v.timep;
   if ('time' in v && Object.keys(v).length === 1) return v.time;
   const o = {}; for (const [k, x] of Object.entries(v)) o[k] = unwrap(x); return o;
 };
-// An instant as milliseconds; Pact's high-precision form carries microseconds,
-// which Date.parse does not take, so the fraction is cut to milliseconds first.
-const toMs = (iso) => Date.parse(String(iso).replace(/(\.\d{3})\d+/, '$1'));
 const stamp = () => new Date().toLocaleTimeString();
 const say = (m) => console.log(`${stamp()}  ${m}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// ---- BEACONS, PACING AND SENDING. Pure except for `fetch` and `local`, and kept together between
+// these two markers so a test can load exactly these bytes (both cranks carry them byte for byte).
+// ==== BEGIN BEACON ====
+// An instant as milliseconds; Pact's high-precision form carries microseconds,
+// which Date.parse does not take, so the fraction is cut to milliseconds first.
+const toMs = (iso) => Date.parse(String(iso).replace(/(\.\d{3})\d+/, '$1'));
+
+// drand evmnet — the ONLY network Pact can verify (it is the only BN254 one), and the one the
+// contract's sealed verifier pins.
+const DRAND_CHAIN = '04f1e9062b8a81f848fded9c12306733282b2727ecced50032187751166ec8c3';
+// Independent relays of the SAME chain. A hostile relay cannot forge a beacon the
+// contract will accept, so this covers silence — which is the only real risk.
+const RELAYS = (process.env.DRAND_RELAYS ??
+  'https://api.drand.sh,https://api2.drand.sh,https://api3.drand.sh,https://drand.cloudflare.com'
+).split(',').map((s) => s.trim()).filter(Boolean);
+// The first retry after a beacon could not be had. Later retries back off with how late the
+// beacon already is (a tenth of it), up to MAX_SLEEP: a relay outage of minutes is retried in
+// seconds, and a drand outage of days does not cost four relay requests every few seconds.
+const BEACON_RETRY_MS = Number(process.env.BEACON_RETRY_MS ?? 15000);
+
+// 🔴 A RELAY ANSWER IS UNTRUSTED INPUT, AND ONE OF ITS FIELDS ENDS UP INSIDE A
+// SIGNED TRANSACTION. Exactly TWO fields are ever read, and both are checked.
+// `round` must be the round asked for: a relay answering a different round is
+// answering a different question. `signature` must be 128 hex characters, which
+// is the CONTRACT'S OWN bound (`g1-from-hex`): a short, long or non-hex answer is
+// refused on chain whatever this bot does, and checking it here refuses it before
+// anything is signed. `randomness` is deliberately NOT read: the contract derives
+// its seed from the verified signature, so a relay's idea of the randomness
+// cannot move any outcome. The signature travels in transaction DATA, never in
+// the code.
+const SIG_HEX = /^[0-9a-fA-F]{128}$/;
+
+// Every relay's answer, one at a time: a caller that finds an answer REFUSED in a dry run asks the
+// next relay instead of giving up on the round.
+async function* beacons(round) {
+  for (const base of RELAYS) {
+    try {
+      const res = await fetch(`${base}/${DRAND_CHAIN}/public/${round}`, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) continue;
+      const j = await res.json();
+      if (Number(j?.round) !== round) { say(`  relay ${base} answered round ${j?.round} for ${round} — skipped`); continue; }
+      const sig = j?.signature;
+      if (typeof sig !== 'string' || !SIG_HEX.test(sig)) {
+        say(`  relay ${base} answered round ${round} with a signature that is not 128 hex characters (${typeof sig === 'string' ? `${sig.length} chars, starts ${JSON.stringify(sig.slice(0, 24))}` : `type ${typeof sig}`}) — skipped, trying the next relay`);
+        continue;
+      }
+      yield { base, sig };
+    } catch { /* try the next relay */ }
+  }
+}
+
+// 🔴 A SEND THAT ABORTS STILL PAYS ITS GAS. Each relay's signature is dry-run first with the
+// round's `preview` over /local (free): it verifies the signature on chain exactly as `draw` will
+// and returns who wins. The first one the chain accepts is returned with that preview; an
+// identical signature from a second relay is not dry-run twice. Returns { sig, base, pv }, or
+// { none: true } when no relay answered at all, or { refused, answered } when every answer was
+// refused, or { settled } when the chain says the round is already settled — an answer about the
+// ROUND, which no other relay can change, so the search ends there. A NODE failure (an error
+// carrying `node`) is no answer at all and is thrown, never counted as a relay being refused.
+async function acceptedBeacon(round, previewCode) {
+  const tried = new Set();
+  let answered = 0, lastWhy = '';
+  for await (const { base, sig } of beacons(round)) {
+    answered++;
+    const key = sig.toLowerCase();
+    if (tried.has(key)) continue;
+    tried.add(key);
+    try { return { sig, base, pv: await local(previewCode, { sig }) }; }
+    catch (e) {
+      if (e?.node) throw e;
+      if (SETTLED.test(String(e?.message))) return { settled: String(e.message) };
+      lastWhy = String(e.message);
+      say(`  relay ${base}: beacon ${round} refused in a preview, trying the next relay (${lastWhy.slice(0, 120)})`);
+    }
+  }
+  return answered === 0 ? { none: true } : { refused: lastWhy, answered };
+}
+
+/** What a selling round needs next, from the chain's clock `nowMs` and the round's own instants
+ *  (draw-status). Every comparison is the module's own: the beacon is due at `beacon-at` (>=), and
+ *  the escape opens strictly after `escape-from` (>). */
+function plan(nowMs, closesAt, st) {
+  if (nowMs < toMs(closesAt)) return { do: 'wait', at: closesAt, why: 'selling' };
+  if (nowMs < toMs(st['beacon-at'])) return { do: 'wait', at: st['beacon-at'], why: 'beacon' };
+  return { do: 'draw', escapeOpen: nowMs > toMs(st['escape-from']) };
+}
+
+/** When to try a beacon again after no relay produced one the chain accepts: BEACON_RETRY_MS at
+ *  first, then a tenth of how late the beacon already is, never more than MAX_SLEEP, and never
+ *  past the moment the escape opens (a second after it). Chain-clock milliseconds in, out. */
+function beaconRetryAt(nowMs, beaconAtMs, escapeFromMs) {
+  const late = Math.max(0, nowMs - beaconAtMs);
+  const wait = Math.min(Math.max(BEACON_RETRY_MS, late / 10), MAX_SLEEP);
+  return nowMs <= escapeFromMs ? Math.min(nowMs + wait, escapeFromMs + 1000) : nowMs + wait;
+}
+
+// ---- THE DRAW ITSELF. 🔴 A SEND THAT ABORTS STILL PAYS ITS WHOLE GAS LIMIT. The preview above
+// proves the BEACON; it is not the draw. So the exact draw — same code, same signer and coin.GAS
+// capability, same signature in the same data, the same payee — is dry-run over /local first, and
+// only a draw the chain accepts there is sent. Two cranks racing, or anything that makes `draw` fail
+// while `preview` passes, then costs a free /local instead of a mined failure every pass
+// (roulette's two bots, 2026-09-25: lost races at a fixed 30,000 were 93 % of all gas spent).
+//
+// The contract's refusal of a round that is no longer selling: `draw` says "this round is already
+// settled", `preview` and `draw-status` say "this round is settled — …". Either one means another
+// crank got there first: nothing is sent.
+const SETTLED = /this round is (already )?settled/;
+// The CAP, and the limit the dry run itself runs under, so a draw that would not fit fails there,
+// for free. A draw verifies the beacon on chain and pays up to ten winners, the drawer and the
+// revenue account: 4,175 gas at that worst case in the Pact 5.4 REPL (prize-draw's worst-case suite),
+// and the drand module's notes budget up to ~21,000 for the verification if the pairing cost is
+// ever re-benched. 30,000 covers that and still packs beside other transactions.
+const DRAW_GAS = 30000;
+// The limit a send asks for: three times what the dry run measured, never under 5,000, never over
+// DRAW_GAS — the baccarat crank's rule. The margin covers what a /local without preflight does not
+// charge (the transaction's size) and a block that lands between the dry run and the send. A dry
+// run that reported no usable gas figure keeps the cap.
+const limitFrom = (gas) => (Number.isFinite(gas) && gas > 0 ? Math.min(DRAW_GAS, Math.max(5000, Math.ceil(3 * gas))) : DRAW_GAS);
+
+/** Dry-run, then send. `dryRun()` resolves to the node's WHOLE /local answer ({ result, gas }) and
+ *  throws only on a node failure, which is passed on and sends nothing. `sendAt(limit)` sends the
+ *  same transaction with that gas limit. Returns { settled } or { refused } (nothing was sent), or
+ *  { sent, gas, limit }. A failed dry run reports the whole limit as its gas, so its gas is never
+ *  read. */
+async function drawSized(dryRun, sendAt) {
+  const full = await dryRun();
+  const res = full?.result;
+  if (res?.status !== 'success') {
+    const why = String(res?.error?.message ?? JSON.stringify(res?.error ?? 'the dry run returned no result'));
+    return SETTLED.test(why) ? { settled: why } : { refused: why };
+  }
+  const gas = Number(full.gas), limit = limitFrom(gas);
+  return { sent: await sendAt(limit), gas, limit };
+}
+
+// ---- TWO CRANKS, ONE LEADER. Run as a pair, both would see a beacon in the same second and both
+// would act. A FOLLOWER (CRANK_FOLLOWER_MS > 0) lets a round sit this long, from the moment THIS
+// process first sees it drawable (or escapable), before it does anything at all — and the round's
+// state is read again after the wait, so a round the leader settled meanwhile costs the follower
+// one read. The leader runs at 0, the default. Counted on this machine's clock from its own first
+// sight, so a backlog met at a restart is left to the leader too.
+const FOLLOWER_MS = (() => { const v = Number(process.env.CRANK_FOLLOWER_MS ?? 0); return Number.isFinite(v) && v > 0 ? v : 0; })();
+/** How much longer a follower waits before touching a round it first saw drawable at
+ *  `firstSeenMs`; 0 means act now (and always 0 for a leader). */
+const followerWait = (firstSeenMs, nowMs) => Math.max(0, firstSeenMs + FOLLOWER_MS - nowMs);
+
+// ---- EVERY UNSETTLED ROUND, NOT THE NEWEST FEW. A raffle's rounds are seq 1..round-seq, and a
+// round can wait days for a draw (a crank outage, a drand outage) while newer rounds open on top of
+// it; a window over the newest rounds would forget it for good. So each raffle keeps every round
+// not yet PROVEN settled, with the chain instant it next needs looking at: a round whose next
+// instant has not come costs no read at all, and a round proven drawn (or escaped and refunded)
+// leaves the set and is never read again by this process. Work per pass is bounded: at most
+// ROUNDS_PER_PASS rounds are read, the ones waiting longest first (a round never read yet counts
+// as waiting since the epoch, newest of those first), so a long history is worked through over
+// several quick passes and no round can be starved by the others.
+const ROUNDS_PER_PASS = 20;
+/** Which rounds to read this pass. `open` maps seq -> the chain-clock ms it is next due (0 = never
+ *  read); returns { batch, more } — `more` when rounds due now were left for the next pass. */
+function dueRounds(open, nowMs) {
+  const due = [...open].filter(([, at]) => at <= nowMs).sort((a, b) => a[1] - b[1] || b[0] - a[0]);
+  return { batch: due.slice(0, ROUNDS_PER_PASS).map(([s]) => s), more: due.length > ROUNDS_PER_PASS };
+}
+// ==== END BEACON ====
+
 // ---- THE DEAD-MAN'S SWITCH. Set HEARTBEAT_URL to a ping URL from any uptime
 // service that alerts when pings STOP (healthchecks.io's free tier, Better
-// Stack, your own endpoint). This bot pings it after every pass in which it
-// read the chain successfully, so silence means the process, the machine, the
-// network or the node is gone — and you hear about it from something that is
-// not running on the machine that died. Nothing tells you otherwise: a crank
+// Stack, your own endpoint). This bot pings it every 15 s while every raffle's
+// last pass COMPLETED with every read and send answered (see `unhealthy`), so
+// silence means the process, the machine, the network or the node is gone, or
+// a raffle's loop is stuck — and you hear about it from something that is not
+// running on the machine that died. Nothing tells you otherwise: a crank
 // that stops settling delays draws until someone notices.
 //
 // It never throws and never waits long: monitoring that can break the thing it
@@ -197,36 +329,49 @@ async function beat() {
   }
 }
 
-async function local(code) {
-  const tx = Pact.builder.execution(code)
-    .setMeta({ chainId: CH, senderAccount: BOT.account, gasLimit: 150000, gasPrice: GAS_PRICE })
-    .setNetworkId(NETWORK).createTransaction();
-  const r = await client.local(tx, { preflight: false, signatureVerification: false });
-  if (r.result.status !== 'success') throw new Error(JSON.stringify(r.result.error));
-  return unwrap(r.result.data);
-}
-const build = (code, gasLimit, nonce) => {
-  const tx = Pact.builder.execution(code)
-    .addSigner(BOT.publicKey, (wc) => [wc('coin.GAS')])
-    .setMeta({ chainId: CH, senderAccount: BOT.account, gasLimit, gasPrice: GAS_PRICE })
-    .setNetworkId(NETWORK).addData('n', nonce).createTransaction();
-  return createSignWithKeypair(BOT)(tx);
+// `data` is how untrusted strings reach the chain: a relay's signature is read with
+// (read-string "sig"), never written into `code`.
+//
+// 🔴 TWO FAILURES, KEPT APART. The contract refusing something is an ANSWER and is thrown as a plain
+// Error carrying the contract's message. The node not answering — a timeout, a refused connection,
+// a reset — is NO answer: it is thrown with `node: true`, so no caller can log it as the contract
+// saying no, and the pass it happened in is not reported healthy.
+const nodeFailure = (what, e) =>
+  Object.assign(new Error(`node ${HOST_URL} ${what}: ${String(e?.cause?.message ?? e?.message ?? e).slice(0, 160)}`), { node: true });
+/** One transaction, as the draw sends it or as a read: code, then data, then — for a send — the
+ *  bot's signer with coin.GAS alone and a nonce. Unsigned. */
+const txFor = (code, gasLimit, data = {}, nonce) => {
+  let b = Object.entries(data).reduce((b, [k, v]) => b.addData(k, v), Pact.builder.execution(code));
+  if (nonce !== undefined) b = b.addSigner(BOT.publicKey, (wc) => [wc('coin.GAS')]);
+  b = b.setMeta({ chainId: CH, senderAccount: BOT.account, gasLimit, gasPrice: GAS_PRICE }).setNetworkId(NETWORK);
+  if (nonce !== undefined) b = b.addData('n', nonce);
+  return b.createTransaction();
 };
-// `timeout` is how long to wait for the transaction to be MINED. A draw was
-// measured taking up to ~27 blocks to be included on the devnet when it carried
-// a whole-block gas limit, so it gets a longer window than the small cranks;
-// giving up early only produces a false "refused" for a draw that is still
-// pending (a re-sent duplicate is refused by the module, never paid twice).
-async function send(code, label, gasLimit = 20000, timeout = 120000) {
-  const signed = await build(code, gasLimit, `${label}-${Date.now()}`);
-  const r = await client.pollOne(await client.submit(signed), { timeout, interval: 2000 });
-  if (r.result.status !== 'success') throw new Error(JSON.stringify(r.result.error).slice(0, 180));
-  say(`  ${label} ok (gas ${r.gas}, block ${r?.metaData?.blockHeight})`);
+/** The node's WHOLE /local answer — `gas` sits beside `result`, not inside it. Signatures are not
+ *  checked, so an unsigned copy of a send dry-runs exactly as the signed one would execute. */
+async function localCmd(tx) {
+  try { return await client.local(tx, { preflight: false, signatureVerification: false, signal: AbortSignal.timeout(NODE_TIMEOUT) }); }
+  catch (e) { throw nodeFailure('/local', e); }
+}
+async function local(code, data = {}) {
+  const r = await localCmd(txFor(code, 150000, data));
+  if (r?.result?.status !== 'success') throw new Error(JSON.stringify(r?.result?.error ?? r));
   return unwrap(r.result.data);
 }
-async function height() {
-  const r = await fetch(`${HOST_URL}/chainweb/0.0/${NETWORK}/cut`);
-  return Number((await r.json()).hashes[CH].height);
+// `timeout` is how long to wait for the transaction to be MINED. Giving up early
+// only produces a false "refused" for a draw that is still pending (a re-sent
+// duplicate is refused by the module, never paid twice).
+async function send(code, label, gasLimit = 20000, timeout = 120000, data = {}) {
+  const signed = await createSignWithKeypair(BOT)(txFor(code, gasLimit, data, `${label}-${Date.now()}`));
+  let desc, r;
+  try { desc = await client.submit(signed, { signal: AbortSignal.timeout(NODE_TIMEOUT) }); }
+  catch (e) { throw nodeFailure(`send of ${label}`, e); }
+  // pollOne keeps its own overall timeout; the signal also aborts a single poll that hangs.
+  try { r = await client.pollOne(desc, { timeout, interval: 2000, signal: AbortSignal.timeout(timeout + NODE_TIMEOUT) }); }
+  catch (e) { throw nodeFailure(`waiting ${Math.round(timeout / 1000)}s for ${label} (${desc.requestKey}) to be mined`, e); }
+  if (r.result.status !== 'success') throw new Error(JSON.stringify(r.result.error).slice(0, 180));
+  say(`  ${label} ok (gas ${r.gas} of limit ${gasLimit}, block ${r?.metaData?.blockHeight})`);
+  return unwrap(r.result.data);
 }
 // The chain's clock, exactly as the module reads it: (chain-data)'s block-time
 // over /local — the PARENT block's stamp, the value every calendar gate in the
@@ -237,21 +382,45 @@ async function chainTime() {
   return String(await local(`(at 'block-time (chain-data))`));
 }
 
-// Read from the module, never assumed: how many candidates decide a round. A
-// crank that guessed this could escape a round that is still decidable; one
-// that cannot read it should not run.
-// The block record the contract reads, taken from the CONTRACT ITSELF, on chain: its `(use <name>
-// "<hash>" …)` line names the record FULLY (free.block-history), not relative to DRAW_NS. Reading
-// it from the deployed code rather than from a local file means this bot cannot attest to a
-// different record than the one the contract settles from, and needs no copy of the contract.
+// ---- THE BEACON VERIFIER, CHECKED BEFORE ANYTHING ELSE. The contract names the drand verifier it
+// uses, and the code hash it is pinned to, in its own `(use <ns>.drand "<hash>" …)` line. This bot
+// ships no copy of the contract, so it reads that line from the DEPLOYED code, then checks the
+// verifier on chain has exactly that hash — and refuses to start otherwise. A contract without that
+// line is not the drand version (the previous version drew from block hashes and takes different
+// arguments), and a crank run against it would only send transactions that fail.
 const CODE = await local(`(at 'code (describe-module "${MOD}"))`).catch((e) => {
   console.error(`cannot read ${MOD} from ${HOST_URL}: ${String(e.message).slice(0, 160)}`);
   console.error('the contract must be deployed on this chain before a crank can run against it');
   process.exit(1);
 });
-const USE = String(CODE).match(/\(use ([\w.-]+\.block-history) "[A-Za-z0-9_-]{43}"/);
-if (!USE) { console.error(`${MOD} on chain does not name a block-history record — is this the right module?`); process.exit(1); }
-const BH = USE[1];
+const USE = String(CODE).match(/\(use ([\w.-]+\.drand) "([A-Za-z0-9_-]{43})"/);
+if (!USE) {
+  console.error(`${MOD} on chain does not name a drand verifier — this crank settles only the drand version of the contract`);
+  process.exit(1);
+}
+const [, DRAND, DRAND_PIN] = USE;
+{
+  const onChain = await local(`(at 'hash (describe-module "${DRAND}"))`).catch((e) => {
+    console.error(`cannot read the drand verifier ${DRAND} on chain ${CH}: ${String(e.message).slice(0, 160)}`);
+    process.exit(1);
+  });
+  if (onChain !== DRAND_PIN) {
+    console.error(`${DRAND} on chain ${CH} has hash ${onChain}, but ${MOD} pins ${DRAND_PIN} — refusing to start`);
+    process.exit(1);
+  }
+  // And the drand CHAIN this bot fetches beacons from must be the one that verifier pins
+  // (its CHAIN-HASH constant). A wrong DRAND_CHAIN is harmless to the contract — every beacon from
+  // it would be refused in the preview — but then no round would ever be drawn, and after 90 days
+  // every one would escape. Refuse now instead.
+  const pinnedChain = await local(`${DRAND}.CHAIN-HASH`).catch((e) => {
+    console.error(`cannot read ${DRAND}.CHAIN-HASH on chain ${CH}: ${String(e.message).slice(0, 160)}`);
+    process.exit(1);
+  });
+  if (pinnedChain !== DRAND_CHAIN) {
+    console.error(`this bot fetches beacons from drand chain ${DRAND_CHAIN}, but ${DRAND} verifies chain ${pinnedChain} — refusing to start`);
+    process.exit(1);
+  }
+}
 
 // The payee must ALREADY EXIST on this chain. A round pays every party with
 // `transfer`, not `transfer-create`, so naming an account that has never been
@@ -276,51 +445,7 @@ const BH = USE[1];
   }
 }
 
-const W = await local(`${MOD}.DECIDE-WINDOW`);
-// Seconds of chain time past a round's draw instant after which a draw nobody
-// opened lets the round escape. This bot opens draws, so reaching it means no
-// bot was running; it is read so the bot can say how far past it a round is.
-const OPEN_GRACE = Number(await local(`${MOD}.OPEN-DRAW-GRACE-SECONDS`));
-
-const ORD = ['first', 'second', 'third', 'fourth', 'fifth'];
-/** Which candidate decided, in words, and which ones before it were missed. */
-function whichCandidate(d, dh) {
-  if (d === dh) return `the first candidate`;
-  const missed = Array.from({ length: d - dh }, (_, i) => dh + i).join(', ');
-  return `the ${ORD[d - dh] ?? `#${d - dh + 1}`} candidate — block(s) ${missed} never recorded`;
-}
-
-/** Record one of a round's candidate blocks. Fires a freshly signed attest every
- *  SHOT_MS while the tip sits between dh-1 and the last candidate, and stops as
- *  soon as ANY candidate is on record — from then on nothing changes which one
- *  decides. Returns the deciding block, or -1 if none is recorded (yet). Shots
- *  still in flight are left to land on their own, so the draw is not held up. */
-async function attestWindow(id, seq, dh) {
-  const last = dh + W - 1;
-  say(`${id} round ${seq}: candidate blocks ${dh}..${last} — attesting from height ${dh - 1} until one is on record`);
-  let n = 0, lastFire = 0;
-  for (;;) {
-    const h = await height();
-    if ((await local(`(${MOD}.decided-height ${dh})`)) >= 0 || h > last) break;
-    if (h >= dh - 1 && Date.now() - lastFire >= SHOT_MS) {
-      const i = ++n; lastFire = Date.now(); const sentAt = h;
-      const signed = await build(`(${BH}.attest)`, 400, `attest-${id}-${seq}-${dh}-${i}-${Date.now()}`);
-      client.submit(signed)
-        .then((rk) => client.pollOne(rk, { timeout: 90000, interval: 1000 }))
-        .then((r) => {
-          const at = r?.metaData?.blockHeight;
-          const ok = r?.result?.status === 'success';
-          say(`  ${id} shot ${i} sent at ${sentAt}, mined in block ${at}: ${ok ? r.result.data : 'FAILED'}`
-            + (at - 1 >= dh && at - 1 <= last ? `  <- the block that can record candidate ${at - 1}` : ''));
-        })
-        .catch((e) => say(`  ${id} shot ${i} lost: ${String(e.message).slice(0, 100)}`));
-    }
-    await sleep(700);
-  }
-  return local(`(${MOD}.decided-height ${dh})`);
-}
-
-/** Push every unpaid buyer's refund out of an escaped round. */
+/** Push every unpaid buyer's refund out of an escaped round. A node failure is thrown on. */
 async function refund(id, seq, tickets) {
   // the buyers are the ticket rows themselves — complete, and from the chain
   const accounts = [...new Set(await local(
@@ -331,13 +456,14 @@ async function refund(id, seq, tickets) {
     if (hd.paid) continue;
     open++;
     try { await send(`(${MOD}.claim-escape "${id}" ${seq} "${a}")`, `${id} refund ${a.slice(0, 14)}…`); open--; }
-    catch (e) { say(`  refund refused: ${e.message}`); }
+    catch (e) { if (e.node) throw e; say(`  refund refused: ${e.message}`); }
   }
   return open === 0;
 }
 
 const reported = new Set();   // things already announced, so a poll loop says each once
 const finished = new Set();   // rounds this bot has nothing left to do for
+const firstDrawable = new Map();   // round key -> when THIS process first saw it drawable (the follower clock)
 
 /** Say a thing once per key, however many times the loop comes round. */
 function once(key, msg) {
@@ -346,15 +472,16 @@ function once(key, msg) {
   say(msg);
 }
 
-/** Escape a round that can never be drawn, then push every buyer's refund. */
+/** Escape a round nobody could draw, then push every buyer's refund. */
 async function escapeAndRefund(id, seq, why, tickets, key) {
   try { say(`  ${await send(`(${MOD}.escape "${id}" ${seq})`, `${id} ESCAPE (${why})`)}`); }
-  catch (e) { say(`  escape refused: ${e.message}`); return; }
+  catch (e) { if (e.node) throw e; say(`  escape refused: ${e.message}`); return; }
   if (await refund(id, seq, tickets)) { finished.add(key); say(`${id} round ${seq}: every buyer refunded`); }
 }
 
 /** One round, wherever it stands. Returns when to look again: TIGHT, or { at: <chain instant> },
- *  or nothing when this round needs no further attention and the raffle decides the pace. */
+ *  or nothing when this round needs no further attention (it is then in `finished`). A node
+ *  failure is thrown; a contract refusal is logged and retried later. */
 async function handleRound(id, seq, rd, key) {
   if (rd.state === 'drawn') { finished.add(key); return; }
   if (rd.state === 'escaped') {
@@ -363,151 +490,135 @@ async function handleRound(id, seq, rd, key) {
     return TIGHT;
   }
   // A round row from an earlier generation comes back exactly as it was
-  // written — Pact adds no fields a later schema declared and removes none an
-  // older one had — and this module settles only a "selling" round that holds
-  // at least one ticket (a round now exists only from its first ticket).
-  // Nothing here can move any other row; say so once instead of failing every poll.
+  // written, and this module settles only a "selling" round that holds at least
+  // one ticket (a round exists only from its first ticket). Nothing here can
+  // move any other row; say so once instead of failing every poll.
   if (rd.state !== 'selling' || !(rd.tickets > 0)) {
     once(key, `${id} round ${seq} is in state "${rd.state}" with ${rd.tickets} ticket(s) — a row from an earlier generation that no path settles. Skipping.`);
     finished.add(key);
     return;
   }
 
-  // Every calendar comparison below is against the CHAIN's clock, the one the
-  // module's own gates read. The round's three instants were frozen by its first
-  // ticket; a `time` comes back as an ISO string once unwrapped.
+  // Every comparison below is against the CHAIN's clock, the one the module's
+  // own gates read. The round's instants and its drand round were frozen by its
+  // first ticket; draw-status reports them.
   const now = await chainTime();
-  const ca = rd['closes-at'], da = rd['draws-at'];
-  if (toMs(now) < toMs(ca)) {                                        // still selling
-    once(`${key}|selling`, `${id} round ${seq}: selling until ${ca} (${rd.tickets} ticket(s) so far); the draw opens at ${da}`);
-    // Nothing for this bot to do while a round sells: buyers open it, and the bot's first move is
-    // open-draw at the draw instant. Sleep to it.
-    return { at: da };
+  const nowMs = toMs(now);
+  const st = await local(`(${MOD}.draw-status "${id}" ${seq})`);
+  const dr = st['drand-round'];
+  // Only the drand version of the module reports these; anything else is the wrong contract.
+  if (!(dr > 0) || !st['beacon-at'] || !st['escape-from']) throw new Error(`draw-status of ${id} round ${seq} has no drand round — is this the drand version of ${MOD}?`);
+  const p = plan(nowMs, rd['closes-at'], st);
+  if (p.do === 'wait') {
+    once(`${key}|${p.why}`, p.why === 'selling'
+      ? `${id} round ${seq}: selling until ${rd['closes-at']} (${rd.tickets} ticket(s) so far); drand round ${dr} decides it, published at ${st['beacon-at']}`
+      : `${id} round ${seq}: sales closed with ${rd.tickets} ticket(s) — drand round ${dr} decides it, published at ${st['beacon-at']}; this bot draws it then`);
+    return { at: p.at };
   }
 
-  // 0. OPEN THE DRAW. Between close and draw nothing exists that could decide
-  //    the round: no candidate block is named until somebody sends open-draw at
-  //    or after draws-at, and that somebody is this bot. Permissionless, gas
-  //    only, and whoever sends it chooses nothing — the heights it fixes are
-  //    DECIDE-DELAY blocks in the future. The window it names starts two blocks
-  //    after the transaction lands, so the bot goes straight to the window in
-  //    this same pass rather than waiting a poll.
-  let dh = rd['decide-height'];
-  if (dh === 0) {
-    if (toMs(now) < toMs(da)) {
-      once(`${key}|drawwait`, `${id} round ${seq}: sales closed at ${ca} with ${rd.tickets} ticket(s) — the draw opens at ${da}, and this bot will open it then`);
-      return { at: da };
-    }
-    const lateBy = (toMs(now) - toMs(da)) / 1000;
-    if (lateBy > OPEN_GRACE) {
-      // Should never be reached while a bot runs: the draw instant is a day or
-      // more behind and nobody opened it. Say so loudly. A draw opened late is
-      // still a fair draw — the candidates are still future blocks — so open it
-      // anyway, and escape only if the module refuses.
-      once(`${key}|neveropened`, `!!! ${id} round ${seq}: its draw instant ${da} passed ${Math.round(lateBy / 3600)} h ago and NOBODY opened the draw`
-        + ` — no bot was running. The round is past the module's ${OPEN_GRACE}-second open grace and could be escaped; trying to open the draw`
-        + ` first, because a late draw is still a fair one. If the module refuses, it escapes: every stake goes home.`);
-    }
+  // A follower leaves a round it has just seen become drawable to the leader. The next look reads
+  // the round's state afresh, so a round the leader settled meanwhile ends there.
+  if (!firstDrawable.has(key)) firstDrawable.set(key, Date.now());
+  const follow = followerWait(firstDrawable.get(key), Date.now());
+  if (follow > 0) {
+    once(`${key}|follow`, `${id} round ${seq}: drawable — this bot is a follower (CRANK_FOLLOWER_MS ${FOLLOWER_MS}), leaving it to the leader for ${Math.ceil(follow / 1000)}s`);
+    return { at: new Date(nowMs + follow + LEAD).toISOString() };
+  }
+
+  // The beacon is due. Fetch it, have the chain verify it in a free preview, then dry-run the exact
+  // draw and send it only if that passes.
+  const previewCode = `(${MOD}.preview "${id}" ${seq} (read-string "sig"))`;
+  const got = await acceptedBeacon(dr, previewCode);
+  if (got.settled) { say(`${id} round ${seq}: already settled by someone else — nothing sent`); return TIGHT; }
+  if (got.sig) {
+    const pv = got.pv;
+    say(`${id} round ${seq}: drand round ${pv['drand-round']} decides it (beacon from ${got.base}) — preview: ranks ${JSON.stringify(pv.ranks)} pay ${JSON.stringify(pv.amounts)}`);
+    const drawCode = `(${MOD}.draw "${id}" ${seq} "${PAYEE}" (read-string "sig"))`;
+    const data = { sig: got.sig };
+    let d;
     try {
-      say(`  ${await send(`(${MOD}.open-draw "${id}" ${seq})`, `${id} OPEN-DRAW round ${seq}`, 5000)}`);
-    } catch (e) {
-      say(`  open-draw refused: ${e.message}`);
-      if (lateBy > OPEN_GRACE) await escapeAndRefund(id, seq, 'the draw was never opened', rd.tickets, key);
-      return;
-    }
-    const opened = await local(`(${MOD}.get-round "${id}" ${seq})`);
-    dh = opened['decide-height'];
-    if (!(dh > 0)) { say(`  ${id} round ${seq}: open-draw landed but decide-height still reads 0 — checking again next poll`); return TIGHT; }
-    say(`  ${id} round ${seq}: draw opened at chain time ${now} — candidate blocks ${dh}..${dh + W - 1}`);
+      d = await drawSized(() => localCmd(txFor(drawCode, DRAW_GAS, data, `${id}-dry-${Date.now()}`)),
+        (limit) => send(drawCode, `${id} DRAW`, limit, 300000, data));
+    } catch (e) { if (e.node) throw e; d = { failed: String(e.message) }; }
+    if (d.settled) { say(`  the draw's dry run says the round is already settled — nothing sent`); return TIGHT; }
+    if ('sent' in d) { say(`  ${d.sent} (dry run ${d.gas} gas, sent with limit ${d.limit})`); finished.add(key); return; }
+    if (d.refused) say(`  the draw was refused in a dry run, so it was NOT sent (${d.refused.slice(0, 160)})`);
+    else say(`  draw refused: ${d.failed}`);
+  } else if (got.none) {
+    say(`${id} round ${seq}: beacon ${dr} is due (chain time ${now}) but no relay answered for it`);
+  } else {
+    say(`${id} round ${seq}: every relay's answer for beacon ${dr} was refused in a preview (${got.answered}), not sent (${String(got.refused).slice(0, 120)})`);
   }
 
-  // From here every step is keyed on decide-height: the candidates, which of
-  // them (if any) is on record, and whether the window is over.
-  const last = dh + W - 1;              // the last candidate block
-  let h = await height();
-  let status = await local(`(${MOD}.draw-status "${id}" ${seq})`);
-
-  // 1. no candidate is on record and one still can be: be a recorder
-  if (!status['block-recorded'] && h <= last) {
-    if (!ATTEST) {
-      once(`${key}|window`, `${id} round ${seq}: candidate blocks ${dh}..${last} — this bot records nothing`
-        + ` (DRAW_ATTEST=off) and waits for another recorder`);
-      return TIGHT;
-    }
-    const d0 = await attestWindow(id, seq, dh);
-    if (d0 < 0) { say(`  ${id} no candidate of round ${seq} on record yet — checking again`); return TIGHT; }
-    say(`  ${id} block ${d0} decides round ${seq}: ${whichCandidate(d0, dh)}`);
-    status = await local(`(${MOD}.draw-status "${id}" ${seq})`);   // and draw in this same pass
-    h = await height();
-  }
-  const d = status['deciding-block'];
-
-  // 2. a candidate is on record: the outcome is public and final, so settle it
-  //    NOW. There is no confirmations wait and nothing left to publish — the
-  //    deciding block is the lowest recorded candidate, final the moment it
-  //    exists, and `draw` is allowed from that moment.
-  if (d >= 0) {
-    try {
-      const pv = await local(`(${MOD}.preview "${id}" ${seq})`);
-      say(`${id} round ${seq}: block ${pv['deciding-block']} decides it (${whichCandidate(pv['deciding-block'], dh)}; hash`
-        + ` ${pv['block-hash']}) — preview: ranks ${JSON.stringify(pv.ranks)} pay ${JSON.stringify(pv.amounts)}`);
-    } catch (e) { say(`${id} round ${seq}: preview refused: ${e.message}`); }
-    try { say(`  ${await send(`(${MOD}.draw "${id}" ${seq} "${PAYEE}")`, `${id} DRAW`, 8000, 300000)}`); finished.add(key); return; }
-    catch (e) { say(`  draw refused: ${e.message}`); }
+  // No draw this pass. Escape ONLY when no relay produced a beacon the chain accepts AND the
+  // chain's clock is past escape-from: until then the round can still be drawn, and a draw is the
+  // answer every buyer bought. A draw that was refused WITH a verified beacon (another crank got
+  // there first, a node hiccup) is retried, never turned into an escape.
+  if (p.escapeOpen && !got.sig) {
+    once(`${key}|escape`, `!!! ${id} round ${seq}: nobody could draw it and its escape opened at ${st['escape-from']} (chain time ${now}).`
+      + ` Escaping it now: every buyer gets their stake back.`);
+    await escapeAndRefund(id, seq, 'no beacon for 90 days', rd.tickets, key);
     return TIGHT;
   }
-  // 3. no candidate yet, and the last one's single recording block (dh + W) is
-  //    not mined yet: one could still land
-  if (h < dh + W) return TIGHT;
-  // 4. none of the candidates was recorded, and from here none ever can be: the
-  //    module lets the round escape at once, and the refund is every buyer's own
-  //    stake plus its share of any bonus
-  once(`${key}|dead`, `!!! ${id} round ${seq}: none of blocks ${dh}..${last} was recorded — this round can never be drawn.`
-    + ` Escaping it now: every buyer gets their stake back.`);
-  await escapeAndRefund(id, seq, 'no candidate recorded', rd.tickets, key);
-  return TIGHT;
+  return { at: new Date(beaconRetryAt(nowMs, toMs(st['beacon-at']), toMs(st['escape-from']))).toISOString() };
 }
 
-/** One raffle. Returns when to look at it again — see `loop`. */
-async function handle(id) {
+const sooner = (a, b) => {
+  if (!a) return b;
+  if (!b) return a;
+  if (a.tight || b.tight) return TIGHT;
+  return toMs(a.at) <= toMs(b.at) ? a : b;
+};
+// Per raffle: the highest round seq enumerated, and every round not yet proven settled with the
+// chain instant (ms) it is next due — see dueRounds.
+const tracked = new Map();
+
+/** One raffle. Returns when to look at it again — see `loop`. Sets `pass.ok` false when any part of
+ *  the pass could not be read or failed. */
+async function handle(id, pass) {
   let r;
-  try { r = await local(`(${MOD}.get-raffle "${id}")`); } catch { return TIGHT; }
+  try { r = await local(`(${MOD}.get-raffle "${id}")`); }
+  catch (e) { pass.ok = false; say(`${id}: cannot read the raffle (${String(e.message).slice(0, 140)})`); return TIGHT; }
   // The raffle's own pace, used when no live round has anything sooner: a round that does not
   // exist yet will draw at the instant the operator scheduled, because its first ticket freezes
   // exactly these three instants into it. EPOCH means unscheduled — nothing can happen until the
   // operator schedules, so wait out a full MAX_SLEEP.
   const nda = String(r['next-draws-at'] ?? '');
   const raffleHint = nda && !nda.startsWith('1970-01-01') ? { at: nda } : undefined;
-  // No round at all: nothing here can start one. A round exists only because
+  // Every round from 1 to round-seq enters the set once; a round proven settled leaves it and is
+  // never read again. No round at all: nothing here can start one — a round exists only because
   // somebody bought its first ticket, which is a buyer, never this bot.
-  if (!r.current) return raffleHint;
-  // The most recent round, and any EARLIER one still unsettled: the operator may
-  // schedule the next round to open as soon as the current one closes, and that
-  // round's first ticket then moves `current` on while the previous one is still
-  // waiting for its draw instant. Walk back until a settled row (everything
-  // below it is older still), a few rounds at most.
-  const seq = r['round-seq'];
-  let hint;
-  const sooner = (a, b) => {
-    if (!a) return b;
-    if (!b) return a;
-    if (a.tight || b.tight) return TIGHT;
-    return toMs(a.at) <= toMs(b.at) ? a : b;
-  };
-  for (let s = seq; s >= 1 && s > seq - 3; s--) {
+  const t = tracked.get(id) ?? { known: 0, open: new Map() };
+  tracked.set(id, t);
+  const seq = Number(r['round-seq']) || 0;
+  for (let s = t.known + 1; s <= seq; s++) t.open.set(s, 0);
+  if (seq > t.known) t.known = seq;
+  if (t.open.size === 0) return raffleHint;
+
+  const nowMs = toMs(await chainTime());
+  const { batch, more } = dueRounds(t.open, nowMs);
+  for (const s of batch) {
     const key = `${id}|${s}`;
-    if (finished.has(key)) break;
-    let rd;
-    try { rd = await local(`(${MOD}.get-round "${id}" ${s})`); } catch { break; }
-    hint = sooner(hint, await handleRound(id, s, rd, key));
-    if (rd.state !== 'selling') break;
+    try {
+      const rd = await local(`(${MOD}.get-round "${id}" ${s})`);
+      const h = await handleRound(id, s, rd, key);
+      if (finished.has(key)) { t.open.delete(s); firstDrawable.delete(key); continue; }
+      t.open.set(s, !h ? nowMs + MAX_SLEEP : h.tight ? nowMs : toMs(h.at) - LEAD);
+    } catch (e) {
+      // The round stays in the set, due, so the next pass tries it again.
+      pass.ok = false;
+      say(`${id} round ${s}: ${String(e.message).slice(0, 160)}`);
+    }
   }
-  return hint ?? raffleHint;
+  if (more) return TIGHT;              // rounds due now were left for the next pass
+  if (t.open.size === 0) return raffleHint;
+  const soonest = Math.min(...t.open.values());
+  return sooner(soonest <= nowMs ? TIGHT : { at: new Date(soonest + LEAD).toISOString() }, raffleHint);
 }
 
 // One independent loop per raffle, started as raffles appear. Each sleeps until its own next
 // instant, so a raffle drawing next Tuesday costs a handful of reads a day and a raffle whose
-// window is open is polled every POLL.
+// beacon is about to be published is polled every POLL.
 const loops = new Map();
 /** How long to wait, given what the pass said it was waiting for. */
 async function waitFor(id, hint) {
@@ -523,36 +634,72 @@ async function waitFor(id, hint) {
   if (ms > 60000) once(`${id}|sleep|${hint.at}`, `${id}: nothing to do before ${hint.at} — checking back every ${Math.round(MAX_SLEEP / 1000)}s until it is close`);
   return sleep(ms);
 }
+// 🔴 THE HEARTBEAT FOLLOWS COMPLETED PASSES, NOT THE MAIN LOOP. Each raffle records its last pass
+// that FINISHED, and whether every read and send in it got an answer. The ping goes out only while
+// every watched raffle's last pass finished cleanly and recently — a raffle stuck on a node that
+// stopped answering must silence the switch, not hide behind a list read that still works.
+// "Recently": its longest sleep plus a generous bound on one pass (every node call has a deadline,
+// so a pass does end; the longest legitimate ones push refunds or wait for a draw to be mined).
+const health = new Map();   // raffle id -> { ok, at } of its last completed pass
+const PASS_STALE = MAX_SLEEP + 15 * 60000;
+function unhealthy(ids) {
+  for (const id of ids) {
+    const h = health.get(id);
+    if (!h) return `${id} has not completed a pass yet`;
+    if (!h.ok) return `${id}'s last pass could not read or send everything it needed`;
+    if (Date.now() - h.at > PASS_STALE) return `${id} has not completed a pass for ${Math.round((Date.now() - h.at) / 60000)} min`;
+  }
+  return '';
+}
 async function loop(id) {
   for (;;) {
+    const pass = { ok: true };
     let hint;
-    try { hint = await handle(id); } catch (e) { say(`${id}: ${String(e.message).slice(0, 140)}`); }
+    try { hint = await handle(id, pass); } catch (e) { pass.ok = false; say(`${id}: ${String(e.message).slice(0, 140)}`); }
+    health.set(id, { ok: pass.ok, at: Date.now() });
     await waitFor(id, hint);
   }
 }
 
-say(`Prize Draw draw bot — ${HOST_URL} chain ${CH} ${MOD} (block record ${BH})`);
-say(`signing as ${WHO} ${BOT.account.slice(0, 16)}…  poll ${POLL}ms when a draw is close, otherwise up to ${Math.round(MAX_SLEEP / 1000)}s  ${ATTEST ? `attest a shot every ${SHOT_MS}ms across the window` : 'NOT attesting (DRAW_ATTEST=off)'}${ONCE ? '  (single pass)' : ''}`);
+say(`Prize Draw draw bot — ${HOST_URL} chain ${CH} ${MOD} (beacon verifier ${DRAND}, hash ${DRAND_PIN}, drand chain ${DRAND_CHAIN.slice(0, 12)}… — checked on chain)`);
+say(`signing as ${WHO} ${BOT.account.slice(0, 16)}…  poll ${POLL}ms when a beacon is close, otherwise up to ${Math.round(MAX_SLEEP / 1000)}s${ONCE ? '  (single pass)' : ''}`);
 say(`earnings go to ${PAYEE}${PAYEE === BOT.account ? ' (this bot\'s own account — set DRAW_PAYEE to send them elsewhere)' : ''}`
   + `  ·  heartbeat ${HEARTBEAT_URL ? 'ON' : 'OFF (set HEARTBEAT_URL and nothing will tell you when this bot dies)'}`);
-say(`rounds run on the calendar (chain time) and exist from their first ticket: this bot opens each draw at its draw instant, which names ${W} candidate blocks;`
-  + ` the lowest recorded decides, and the draw goes out the moment one is on record; a draw still unopened ${OPEN_GRACE} s past its instant is reported LOUDLY`);
+say(`${FOLLOWER_MS ? `FOLLOWER: waits ${FOLLOWER_MS / 1000}s after a round becomes drawable before touching it` : 'LEADER: acts on a round as soon as it is drawable (CRANK_FOLLOWER_MS 0)'}`
+  + `  ·  every draw is dry-run first and sent with 3x its measured gas (at most ${DRAW_GAS})  ·  node timeout ${NODE_TIMEOUT / 1000}s`);
+say(`each round is decided by the drand evmnet beacon pinned at its first ticket: the bot draws it once the chain's clock passes that beacon's publish time,`
+  + ` from relays ${RELAYS.join(' ')}; a round nobody could draw is escaped only after its escape-from, on the chain's clock`);
 if (ONCE) {
   const ids = await local(`(${MOD}.list-raffles)`);
-  await Promise.allSettled(ids.map((id) => handle(id).catch((e) => say(`${id}: ${e.message}`))));
+  const oks = await Promise.all(ids.map(async (id) => {
+    const pass = { ok: true };
+    try { await handle(id, pass); } catch (e) { pass.ok = false; say(`${id}: ${e.message}`); }
+    return pass.ok;
+  }));
   // A single pass pings too, so `--once` also proves the heartbeat URL works rather than leaving
-  // you to find out from the alert that never came.
-  await beat();
-  process.exit(0);
+  // you to find out from the alert that never came — but only a pass that completed cleanly.
+  if (oks.every(Boolean)) { await beat(); process.exit(0); }
+  say('the pass did not complete cleanly (see above) — no heartbeat sent');
+  process.exit(1);
 }
+let withheld = '';
 for (;;) {
   try {
-    for (const id of await local(`(${MOD}.list-raffles)`)) {
+    const ids = await local(`(${MOD}.list-raffles)`);
+    for (const id of ids) {
       if (!loops.has(id)) { say(`watching ${id}`); loops.set(id, loop(id)); }
     }
-    // Only on the path where the read SUCCEEDED: an unreachable node must make
-    // the pings stop, or the switch reports health it has not established.
-    await beat();
+    // Only when the list read SUCCEEDED and every raffle's last pass completed: an unreachable
+    // node must make the pings stop, or the switch reports health it has not established.
+    const why = unhealthy(ids);
+    if (!why) {
+      if (withheld) say('heartbeat on: every raffle\'s last pass completed');
+      withheld = '';
+      await beat();
+    } else if (why !== withheld) {
+      withheld = why;
+      say(`heartbeat withheld: ${why}`);
+    }
   } catch (e) { say(`list error: ${String(e.message).slice(0, 140)}`); }
   await sleep(15000);
 }

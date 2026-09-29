@@ -1,7 +1,7 @@
 {
   "name": "prize-draw-crank",
   "type": "module",
-  "description": "Settles Prize Draw rounds on Kadena: opens each draw at its instant and sends the draw when a candidate block is recorded. Permissionless \u2014 anyone can run one.",
+  "description": "Settles Prize Draw rounds on Kadena: draws each round from its drand beacon once it is published, and refunds a round only if nobody could draw it. Permissionless \u2014 anyone can run one.",
   "scripts": {
     "crank": "node crank.mjs",
     "keygen": "node crank-keygen.mjs"

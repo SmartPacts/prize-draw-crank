@@ -1,5 +1,5 @@
-# /etc/systemd/system/prize-draw-crank.service — the prize-draw crank: opens each round's draw at
-# its advertised instant and settles it.
+# /etc/systemd/system/prize-draw-crank.service — the prize-draw crank: draws each round from its
+# drand beacon once that beacon is published, and refunds a round only if nobody could draw it.
 #
 # Modelled on block-history-feeder.service, which has been running this shape on a DigitalOcean
 # droplet since 2026-09. Install it, but DO NOT enable it here: ENABLING IT STARTS SENDING MAINNET
@@ -11,15 +11,14 @@
 # Started too early it is harmless: with no module deployed, or no KDA on the key, it fails its
 # own startup checks and exits without sending anything.
 #
-# WHAT THIS PROCESS CAN AND CANNOT DO. Every call it makes is permissionless — `open-draw`, the
-# draw itself, `escape`, `claim-escape`. It holds no operator or admin authority, cannot choose a
+# WHAT THIS PROCESS CAN AND CANNOT DO. Every call it makes is permissionless — the draw itself,
+# `escape`, `claim-escape`. It holds no operator or admin authority, cannot choose a
 # winner, and cannot move money anywhere the contract would not send it anyway. A stolen crank key
 # costs what its own account holds: the gas and, with DRAW_PAYEE unset (the default), every
-# drawer's share it has earned and not moved out. With DRAW_PAYEE set, it holds the gas alone
-# (plus the recorder's shares, if DRAW_ATTEST is turned on).
+# drawer's share it has earned and not moved out. With DRAW_PAYEE set, it holds the gas alone.
 
 [Unit]
-Description=prize-draw crank (opens draws at their instant and settles them)
+Description=prize-draw crank (draws each round from its drand beacon and settles it)
 After=network-online.target
 Wants=network-online.target
 # A persistent misconfiguration (an unfunded key, the module not yet deployed) makes the crank exit
@@ -47,16 +46,20 @@ Environment=DRAW_NS=n_48867b242317a0216a67f8c7ca26696b5878e0e3
 # anywhere under this checkout (/opt/prize-draw-crank), so the key lives in /etc, not /opt.
 Environment=DRAW_ACCOUNTS=/etc/prize-draw/crank-key.json
 Environment=DRAW_BOT=crank
-# Block recording is already covered, raffle-blind, by the block-history feeders. The crank's job
-# here is only to open draws and settle them.
-Environment=DRAW_ATTEST=off
-# Pace. The crank sleeps until the next thing that could need doing — a round's draw instant, which
-# it knows from the chain — and polls at POLL_MS only when that moment is close or a candidate
-# window is open. MAX_SLEEP_MS caps a long sleep, which is what bounds how late a round re-scheduled
-# to draw EARLIER could be picked up. Measured on devnet: ten minutes of selling cost two wake-ups,
-# and the draw still went out 35 s after its instant.
+# Pace. The crank sleeps until the next thing that could need doing — a round's close, then the
+# moment drand publishes the round's beacon, both of which it knows from the chain — and polls at
+# POLL_MS only when that moment is close. MAX_SLEEP_MS caps a long sleep, which is what bounds how
+# late a round re-scheduled to draw EARLIER could be picked up.
 Environment=POLL_MS=2500
 Environment=MAX_SLEEP_MS=300000
+# LEADER OR FOLLOWER. The production pair runs two cranks on separate machines: this unit ships
+# every crank as the LEADER (0: act as soon as a round is drawable). On the SECOND machine only,
+# put CRANK_FOLLOWER_MS=90000 in /etc/prize-draw/crank.env: that crank then waits 90 s after it
+# first sees a round drawable, re-reads the round, and acts only if the leader has not settled it.
+Environment=CRANK_FOLLOWER_MS=0
+# Every call to the node gives up after this long. A failed call fails that pass, and the heartbeat
+# is withheld until a pass completes cleanly.
+Environment=NODE_TIMEOUT_MS=30000
 
 # YOUR SETTINGS GO IN A FILE, NOT IN THIS UNIT. Everything above is a shipped
 # default that an update overwrites; /etc/prize-draw/crank.env is yours and is
@@ -65,6 +68,7 @@ Environment=MAX_SLEEP_MS=300000
 #   DRAW_PAYEE=k:…          where this bot's earnings are paid — set it to a cold
 #                           account and the hot key here only ever holds gas
 #   HEARTBEAT_URL=https://… a ping URL that alerts when the pings STOP
+#   CRANK_FOLLOWER_MS=90000 on the second crank of a pair only (see above)
 # The leading `-` means the unit still starts when the file does not exist.
 EnvironmentFile=-/etc/prize-draw/crank.env
 ExecStart=/usr/local/bin/node crank.mjs

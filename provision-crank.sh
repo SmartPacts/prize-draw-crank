@@ -240,7 +240,11 @@ RUN=(systemd-run --quiet --wait --pipe --collect --uid="$SVC_USER" --gid="$SVC_U
      --working-directory="$APP" -p "EnvironmentFile=-$ENV_FILE")
 while IFS= read -r line; do RUN+=(-E "${line#Environment=}"); done < <(grep '^Environment=' "$APP/$UNIT")
 set +e
-OUT=$("${RUN[@]}" /usr/local/bin/node crank.mjs --once 2>&1)
+# The pass runs as a FOLLOWER with a day's delay, set on the command itself so no environment
+# file can override it: a follower never acts on its first sight of a round, so this pass reads
+# and decides but sends nothing, even when a live round is due (without it, a leader's --once
+# pass would draw that round). Everything else is the service's own configuration.
+OUT=$("${RUN[@]}" /usr/bin/env CRANK_FOLLOWER_MS=86400000 /usr/local/bin/node crank.mjs --once 2>&1)
 RC=$?
 set -e
 if [ $RC = 0 ]; then ok "it read the live raffles and made one pass"

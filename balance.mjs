@@ -18,8 +18,10 @@ const CH = process.env.CHAIN_ID ?? '2';
 const ACCTS = process.env.DRAW_ACCOUNTS ?? '/etc/prize-draw/crank-key.json';
 const WHO = process.env.DRAW_BOT ?? 'crank';
 
-// Measured on devnet: opening a draw costs ~191 gas and settling one ~980, at 1e-8 KDA per unit.
-const PER_ROUND = 1171 * 1e-8;
+// A round costs this bot one draw, which verifies the drand beacon on chain. Measured in the Pact 5.4
+// REPL at the module's worst case (ten winners, drand verification included): 4,175 gas, at 1e-8 KDA
+// per unit — used here as the per-round figure, so the estimate errs on the short side.
+const PER_ROUND = 4175 * 1e-8;
 
 function account(file, who) {
   if (!existsSync(file)) return null;
