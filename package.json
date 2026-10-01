@@ -4,7 +4,8 @@
   "description": "Settles Prize Draw rounds on Kadena: draws each round from its drand beacon once it is published, and refunds a round only if nobody could draw it. Permissionless \u2014 anyone can run one.",
   "scripts": {
     "crank": "node crank.mjs",
-    "keygen": "node crank-keygen.mjs"
+    "keygen": "node crank-keygen.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@kadena/client": "^1.18.3",

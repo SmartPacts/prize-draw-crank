@@ -300,20 +300,58 @@ function dueRounds(open, nowMs) {
   const due = [...open].filter(([, at]) => at <= nowMs).sort((a, b) => a[1] - b[1] || b[0] - a[0]);
   return { batch: due.slice(0, ROUNDS_PER_PASS).map(([s]) => s), more: due.length > ROUNDS_PER_PASS };
 }
+// ---- A SCHEDULE THAT HAS LAPSED IS NO SCHEDULE. A raffle's `next-draws-at` is where its NEXT round
+// will draw, and it stands only until that round's first ticket. Once the chain's clock is at or
+// past it and nobody bought, no ticket can be sold into it any more (sales close at or before the
+// draw instant), so nothing can happen until the operator schedules again: it is "nothing due", not
+// an instant to poll towards. EPOCH means unscheduled.
+/** The raffle's own schedule as a pacing hint: { at } while `nextDrawsAt` is still ahead of the
+ *  chain's clock `nowMs`, otherwise nothing. */
+const scheduleHint = (nextDrawsAt, nowMs) =>
+  (nextDrawsAt && !nextDrawsAt.startsWith('1970-01-01') && toMs(nextDrawsAt) > nowMs ? { at: nextDrawsAt } : undefined);
+
+// ---- A ROUND THAT SHOULD HAVE BEEN DRAWN BY NOW. A round is drawable from its beacon's publish
+// time. A healthy crank settles it within a block or two, so one still unsettled STUCK_MS later, on
+// the chain's clock, means something a completed pass does not show: no relay has the beacon, every
+// dry run is refused, or the draws keep failing. A follower gets its own wait on top, because it
+// leaves the round to the leader for that long on purpose. A draw that passed its dry run and then
+// failed when mined paid gas for nothing; STUCK_FAILS of those on one round is the same alarm
+// without waiting for the clock.
+const STUCK_MS = 15 * 60000;
+const STUCK_FAILS = 2;
+/** Why a drawable, unsettled round `o` ({ what, beaconAt, dueMs, fails }) counts as stuck at the
+ *  chain-clock instant `chainNowMs`, or '' while it does not. The text is the same on every call
+ *  for the same reason, so a caller can say it once. */
+const stuckWhy = (o, chainNowMs) =>
+  (o.fails >= STUCK_FAILS ? `${o.what} is drawable and its draw has failed on chain ${STUCK_FAILS} times or more`
+    : chainNowMs - o.dueMs > FOLLOWER_MS + STUCK_MS
+      ? `${o.what} has been drawable since ${o.beaconAt} and is still not settled more than ${Math.round((FOLLOWER_MS + STUCK_MS) / 60000)} min later`
+      : '');
+
+// ---- A NODE WHOSE CLOCK HAS STOPPED. The chain's clock is the parent block's time, so it normally
+// sits a block or so behind the wall clock, and a slow stretch of blocks can stretch that to a few
+// minutes. A node that has fallen behind the network answers every read normally, with an OLD
+// chain time — and a bot pacing itself by that clock would wait for instants that have long
+// passed. NODE_LAG_MS behind this machine's clock is past anything a healthy node shows. A chain
+// time that cannot be read as a number counts as lagging: nothing was established.
+const NODE_LAG_MS = 10 * 60000;
+const nodeLags = (chainMs, wallMs) => !(wallMs - chainMs <= NODE_LAG_MS);
 // ==== END BEACON ====
 
 // ---- THE DEAD-MAN'S SWITCH. Set HEARTBEAT_URL to a ping URL from any uptime
 // service that alerts when pings STOP (healthchecks.io's free tier, Better
 // Stack, your own endpoint). This bot pings it every 15 s while every raffle's
-// last pass COMPLETED with every read and send answered (see `unhealthy`), so
-// silence means the process, the machine, the network or the node is gone, or
-// a raffle's loop is stuck — and you hear about it from something that is not
-// running on the machine that died. Nothing tells you otherwise: a crank
+// last pass COMPLETED with every read and send answered, no drawable round is
+// stuck and the node's clock is current (see `unhealthy`), so silence means the
+// process, the machine, the network or the node is gone or lagging, a raffle's
+// loop is stuck, or a round that should have been drawn has not been — and you
+// hear about it from something that is not running on the machine that died. Nothing tells you otherwise: a crank
 // that stops settling delays draws until someone notices.
 //
 // It never throws and never waits long: monitoring that can break the thing it
 // monitors is worse than no monitoring. Be honest about what it proves — the
-// bot is alive and can read the chain, NOT that a particular round settled.
+// bot is alive, reads a chain whose clock is current, and has no round stuck
+// past the thresholds below; NOT that a particular round settled on time.
 const HEARTBEAT_URL = process.env.HEARTBEAT_URL ?? '';
 let beatFailed = false;
 async function beat() {
@@ -464,6 +502,7 @@ async function refund(id, seq, tickets) {
 const reported = new Set();   // things already announced, so a poll loop says each once
 const finished = new Set();   // rounds this bot has nothing left to do for
 const firstDrawable = new Map();   // round key -> when THIS process first saw it drawable (the follower clock)
+const overdue = new Map();   // round key -> { what, beaconAt, dueMs, fails } of a round drawable and not settled (see stuckWhy)
 
 /** Say a thing once per key, however many times the loop comes round. */
 function once(key, msg) {
@@ -483,6 +522,7 @@ async function escapeAndRefund(id, seq, why, tickets, key) {
  *  or nothing when this round needs no further attention (it is then in `finished`). A node
  *  failure is thrown; a contract refusal is logged and retried later. */
 async function handleRound(id, seq, rd, key) {
+  if (rd.state !== 'selling') overdue.delete(key);   // settled one way or the other: no longer drawable
   if (rd.state === 'drawn') { finished.add(key); return; }
   if (rd.state === 'escaped') {
     if (rd.tickets === 0) { finished.add(key); return; }
@@ -515,6 +555,9 @@ async function handleRound(id, seq, rd, key) {
       : `${id} round ${seq}: sales closed with ${rd.tickets} ticket(s) — drand round ${dr} decides it, published at ${st['beacon-at']}; this bot draws it then`);
     return { at: p.at };
   }
+  // From here the round is DRAWABLE, and stays on record as such until it is settled: the
+  // heartbeat is withheld for a round that sits here too long, or whose draws keep failing.
+  if (!overdue.has(key)) overdue.set(key, { what: `${id} round ${seq}`, beaconAt: st['beacon-at'], dueMs: toMs(st['beacon-at']), fails: 0 });
 
   // A follower leaves a round it has just seen become drawable to the leader. The next look reads
   // the round's state afresh, so a round the leader settled meanwhile ends there.
@@ -539,7 +582,7 @@ async function handleRound(id, seq, rd, key) {
     try {
       d = await drawSized(() => localCmd(txFor(drawCode, DRAW_GAS, data, `${id}-dry-${Date.now()}`)),
         (limit) => send(drawCode, `${id} DRAW`, limit, 300000, data));
-    } catch (e) { if (e.node) throw e; d = { failed: String(e.message) }; }
+    } catch (e) { if (e.node) throw e; d = { failed: String(e.message) }; overdue.get(key).fails++; }
     if (d.settled) { say(`  the draw's dry run says the round is already settled — nothing sent`); return TIGHT; }
     if ('sent' in d) { say(`  ${d.sent} (dry run ${d.gas} gas, sent with limit ${d.limit})`); finished.add(key); return; }
     if (d.refused) say(`  the draw was refused in a dry run, so it was NOT sent (${d.refused.slice(0, 160)})`);
@@ -576,15 +619,16 @@ const tracked = new Map();
 /** One raffle. Returns when to look at it again — see `loop`. Sets `pass.ok` false when any part of
  *  the pass could not be read or failed. */
 async function handle(id, pass) {
-  let r;
-  try { r = await local(`(${MOD}.get-raffle "${id}")`); }
+  // The chain's clock is read BEFORE the raffle: a schedule found lapsed against a time read first
+  // can have gained no ticket since, so the raffle row read after it is the final word on it.
+  let r, nowMs;
+  try { nowMs = toMs(await chainTime()); r = await local(`(${MOD}.get-raffle "${id}")`); }
   catch (e) { pass.ok = false; say(`${id}: cannot read the raffle (${String(e.message).slice(0, 140)})`); return TIGHT; }
   // The raffle's own pace, used when no live round has anything sooner: a round that does not
   // exist yet will draw at the instant the operator scheduled, because its first ticket freezes
-  // exactly these three instants into it. EPOCH means unscheduled — nothing can happen until the
-  // operator schedules, so wait out a full MAX_SLEEP.
-  const nda = String(r['next-draws-at'] ?? '');
-  const raffleHint = nda && !nda.startsWith('1970-01-01') ? { at: nda } : undefined;
+  // exactly these three instants into it. Unscheduled, or a schedule that lapsed with no ticket
+  // sold — nothing can happen until the operator schedules, so wait out a full MAX_SLEEP.
+  const raffleHint = scheduleHint(String(r['next-draws-at'] ?? ''), nowMs);
   // Every round from 1 to round-seq enters the set once; a round proven settled leaves it and is
   // never read again. No round at all: nothing here can start one — a round exists only because
   // somebody bought its first ticket, which is a buyer, never this bot.
@@ -595,14 +639,13 @@ async function handle(id, pass) {
   if (seq > t.known) t.known = seq;
   if (t.open.size === 0) return raffleHint;
 
-  const nowMs = toMs(await chainTime());
   const { batch, more } = dueRounds(t.open, nowMs);
   for (const s of batch) {
     const key = `${id}|${s}`;
     try {
       const rd = await local(`(${MOD}.get-round "${id}" ${s})`);
       const h = await handleRound(id, s, rd, key);
-      if (finished.has(key)) { t.open.delete(s); firstDrawable.delete(key); continue; }
+      if (finished.has(key)) { t.open.delete(s); firstDrawable.delete(key); overdue.delete(key); continue; }
       t.open.set(s, !h ? nowMs + MAX_SLEEP : h.tight ? nowMs : toMs(h.at) - LEAD);
     } catch (e) {
       // The round stays in the set, due, so the next pass tries it again.
@@ -640,16 +683,28 @@ async function waitFor(id, hint) {
 // stopped answering must silence the switch, not hide behind a list read that still works.
 // "Recently": its longest sleep plus a generous bound on one pass (every node call has a deadline,
 // so a pass does end; the longest legitimate ones push refunds or wait for a draw to be mined).
+//
+// 🔴 AND A COMPLETED PASS IS NOT A SETTLED ROUND. A pass in which no relay had the beacon, or the
+// draw was refused, or was sent and failed when mined, still got an answer to everything it asked.
+// So the ping is also withheld while any round is stuck (see stuckWhy), and while the node's clock
+// has fallen behind this machine's (see nodeLags) — a bot waiting on a stopped clock looks idle,
+// not broken.
 const health = new Map();   // raffle id -> { ok, at } of its last completed pass
 const PASS_STALE = MAX_SLEEP + 15 * 60000;
-function unhealthy(ids) {
+const LAGGING = `the node's chain time is more than ${NODE_LAG_MS / 60000} min behind this machine's clock`;
+/** The first stuck round, as a reason, or ''. */
+function stuck(chainNowMs) {
+  for (const o of overdue.values()) { const why = stuckWhy(o, chainNowMs); if (why) return why; }
+  return '';
+}
+function unhealthy(ids, chainNowMs) {
   for (const id of ids) {
     const h = health.get(id);
     if (!h) return `${id} has not completed a pass yet`;
     if (!h.ok) return `${id}'s last pass could not read or send everything it needed`;
     if (Date.now() - h.at > PASS_STALE) return `${id} has not completed a pass for ${Math.round((Date.now() - h.at) / 60000)} min`;
   }
-  return '';
+  return stuck(chainNowMs);
 }
 async function loop(id) {
   for (;;) {
@@ -677,28 +732,34 @@ if (ONCE) {
     return pass.ok;
   }));
   // A single pass pings too, so `--once` also proves the heartbeat URL works rather than leaving
-  // you to find out from the alert that never came — but only a pass that completed cleanly.
-  if (oks.every(Boolean)) { await beat(); process.exit(0); }
-  say('the pass did not complete cleanly (see above) — no heartbeat sent');
+  // you to find out from the alert that never came — but only a pass that completed cleanly, on a
+  // node whose clock is current, that left no round stuck.
+  if (!oks.every(Boolean)) { say('the pass did not complete cleanly (see above) — no heartbeat sent'); process.exit(1); }
+  const now = await chainTime().catch(() => '');
+  const why = nodeLags(toMs(now), Date.now()) ? `${LAGGING} (chain time ${now || 'unreadable'})` : stuck(toMs(now));
+  if (!why) { await beat(); process.exit(0); }
+  say(`no heartbeat sent: ${why}`);
   process.exit(1);
 }
 let withheld = '';
 for (;;) {
   try {
-    const ids = await local(`(${MOD}.list-raffles)`);
+    // The list of raffles and the chain's clock, in ONE read.
+    const { ids, now } = await local(`{"ids": (${MOD}.list-raffles), "now": (at 'block-time (chain-data))}`);
     for (const id of ids) {
       if (!loops.has(id)) { say(`watching ${id}`); loops.set(id, loop(id)); }
     }
-    // Only when the list read SUCCEEDED and every raffle's last pass completed: an unreachable
-    // node must make the pings stop, or the switch reports health it has not established.
-    const why = unhealthy(ids);
+    // Only when the list read SUCCEEDED, the node's clock is current, every raffle's last pass
+    // completed and no round is stuck: an unreachable or lagging node must make the pings stop, or
+    // the switch reports health it has not established.
+    const why = nodeLags(toMs(now), Date.now()) ? LAGGING : unhealthy(ids, toMs(now));
     if (!why) {
-      if (withheld) say('heartbeat on: every raffle\'s last pass completed');
+      if (withheld) say('heartbeat on: nothing is withholding it any more');
       withheld = '';
       await beat();
     } else if (why !== withheld) {
       withheld = why;
-      say(`heartbeat withheld: ${why}`);
+      say(`heartbeat withheld: ${why}${why === LAGGING ? ` (chain time ${now})` : ''}`);
     }
   } catch (e) { say(`list error: ${String(e.message).slice(0, 140)}`); }
   await sleep(15000);

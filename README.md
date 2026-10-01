@@ -22,11 +22,17 @@ and none of them can steer a result. This repository exists so that anyone can.
 
 ## How it decides when to act
 
-It follows no blocks. Its only fixed-interval read is the list of raffles, once every 15 seconds,
-so it notices a new raffle. Each raffle then runs in its own loop: a round's instants — when sales
+It follows no blocks. Its only fixed-interval read is one call every 15 seconds: the list of
+raffles, so it notices a new raffle, together with the chain's time, so it notices a node that has
+fallen behind. Each raffle then runs in its own loop: a round's instants — when sales
 close, and when drand publishes the round's beacon — are frozen into it by its first ticket, so the
 bot reads them from the chain and **sleeps until the next moment that could need it** (at most
 `MAX_SLEEP_MS`, 5 minutes), polling every `POLL_MS` only when that moment is close.
+
+A raffle with no unsettled round is paced by its schedule: the bot wakes for the scheduled draw
+instant while that is still ahead. A raffle that is not scheduled, or whose schedule has passed
+with no ticket sold, has nothing due. The bot looks at it once every `MAX_SLEEP_MS` (two reads) until a round
+appears or the operator schedules again.
 
 It looks after **every round that is not settled yet**, not just the newest. A raffle's rounds are
 numbered from 1, and the bot enters each one once. A round it has seen drawn, or escaped and
@@ -56,7 +62,10 @@ mined gets its own 5 minutes on top). A node that stops answering makes that pas
 hangs the bot, and it is never logged as the contract refusing something.
 
 It reads time from the chain (the parent block's timestamp), never the wall clock, because that is
-what the contract's own calendar checks compare against.
+what the contract's own calendar checks compare against. Every wait
+for a round's instant is measured on that clock. This machine's own clock is used for two things
+only: a follower's wait, and judging whether the node has fallen behind (see "Knowing it is
+alive").
 
 ## Installing it, and updating it
 
@@ -110,7 +119,7 @@ three times the gas its dry run measured, at most 30,000.
 | `DRAW_ACCOUNTS` / `DRAW_BOT` | a JSON file of `{ "<name>": { account, publicKey, secretKey } }`, and which entry to sign with. **Must live outside this checkout.** |
 | `DRAND_RELAYS` | comma-separated drand relays to fetch beacons from. A dishonest relay cannot change a winner, only fail to answer |
 | `DRAW_PAYEE` | **where your earnings go.** Any ordinary account — point it at a cold wallet and the hot key here only ever holds gas. Defaults to the bot's own account |
-| `HEARTBEAT_URL` | a ping URL that alerts when the pings STOP. Without one, nothing tells you this bot has died |
+| `HEARTBEAT_URL` | a ping URL that alerts when the pings STOP. Without one, nothing tells you this bot has died, or that a round is stuck (see "Knowing it is alive") |
 | `POLL_MS` / `MAX_SLEEP_MS` | the tight interval near an instant, and the cap on a long sleep |
 | `CRANK_FOLLOWER_MS` | `0` (the default) makes this crank a **leader**. Set it on the second crank of a pair, e.g. `90000`, to make it a **follower** (see below) |
 | `NODE_TIMEOUT_MS` | how long one call to the node may take before it counts as failed. Default 30000 |
@@ -197,12 +206,30 @@ confirms it matches. It writes nothing. On a new machine, `restore` writes the k
     node balance.mjs                       # what it holds, what it earned, how long the gas lasts
     journalctl -u prize-draw-crank -n 20 --no-pager
 
-Set `HEARTBEAT_URL` and the bot pings it every 15 seconds, but only while every raffle's last pass
-**finished, and got an answer to every read and send it made**. So an outage reaches you from
-something that did not die with the machine. That covers a dead machine or network, and also a node
-that has stopped answering or a raffle whose loop is stuck. It proves the bot is alive and reading
-the chain, not that a particular round settled. `--once` pings only after a clean pass, and exits 1
-otherwise.
+Set `HEARTBEAT_URL` and the bot pings it every 15 seconds, but only while all of this holds:
+
+- every raffle's last pass **finished, and got an answer to every read and send it made**;
+- **no round is stuck.** A round is stuck when its beacon has been due for more than 15 minutes on
+  the chain's clock and it is still not settled, whatever the cause: no relay has the beacon, the
+  draw is refused in its dry run, or this bot is waiting. On a follower the limit is 15 minutes
+  plus its `CRANK_FOLLOWER_MS`. A round is also stuck as soon as its draw has passed the dry run
+  and then failed twice on chain;
+- **the node's clock is current.** The chain's time is the parent block's timestamp, so it
+  normally sits a block or so behind real time, a few minutes at most (the longest block gap
+  measured on chain 2 is 136 s). If the node reports a chain time more than 10 minutes behind
+  this machine's clock, the node has fallen behind the network (or this machine's clock is wrong),
+  and the bot would be waiting for moments that have already passed.
+
+So an outage reaches you from something that did not die with the machine. That covers a dead
+machine or network, a node that has stopped answering or fallen behind, a raffle whose loop is
+stuck, and a round that should have been drawn and has not been. When it stops pinging, the bot
+writes one `heartbeat withheld: …` line to its log saying why, and keeps working. The pings resume
+on their own once the cause is gone. A stuck round needs no restart: draw it by hand (see below) or
+fix what the log names.
+
+It does not prove every round settled on time: a round up to 15 minutes late does not stop the
+pings. The 15 minutes and the 10 minutes are fixed in the code, not settings. `--once` pings only
+after a clean pass, on a node whose clock is current, that left no round stuck. Otherwise it exits 1.
 
 ## If a crank is down
 
